@@ -51,6 +51,7 @@ func main() {
 			timeout = d
 		}
 	}
+	successOnError := mustEnv("SUCCESS_ON_ERROR", "false") == "true"
 
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -100,15 +101,23 @@ func main() {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			// Upstream unreachable/network error → propagate as 502 (so Argo may retry)
-			http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
-			return
+		    // Treat transport/timeouts as success if enabled
+		    if successOnError {
+		        log.Printf("upstream %s error (%v) treated as success", targetURL, err)
+		        w.Header().Set("Content-Type", "application/json")
+		        w.WriteHeader(http.StatusOK)
+		        _, _ = w.Write([]byte(`{"ok":true,"note":"transport error treated as success"}`))
+		        return
+		    }
+		    // default: propagate as 502 so caller may retry
+		    http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		    return
 		}
 		defer resp.Body.Close()
 
 		// If status is in SUCCESS_ON, swallow it and return 200
 		if _, ok := successOn[resp.StatusCode]; ok {
-      log.Printf("upstream %s → %d (treated as success)", targetURL, resp.StatusCode)
+      		log.Printf("upstream %s → %d (treated as success)", targetURL, resp.StatusCode)
 			// drain body (optional)
 			_, _ = io.Copy(io.Discard, resp.Body)
 			w.Header().Set("Content-Type", "application/json")
