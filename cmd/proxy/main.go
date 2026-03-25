@@ -2,12 +2,18 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -38,35 +44,69 @@ func parseOverrideSet(v string) map[int]struct{} {
 	return set
 }
 
-func main() {
-	upstream := os.Getenv("UPSTREAM_BASE") // e.g. https://romeo.us.demo.dev
-	if upstream == "" {
-		log.Fatal("UPSTREAM_BASE is required")
-	}
-	successOn := parseOverrideSet(mustEnv("SUCCESS_ON", "502,504"))
-	addr := mustEnv("LISTEN_ADDR", ":8080")
-	timeout := time.Duration(10) * time.Second
-	if t := os.Getenv("UPSTREAM_TIMEOUT"); t != "" {
-		if d, err := time.ParseDuration(t); err == nil {
-			timeout = d
-		}
-	}
-	successOnError := mustEnv("SUCCESS_ON_ERROR", "false") == "true"
+func isWakeRequest(r *http.Request) bool {
+	return r.Method == http.MethodPost && isWakePath(r.URL.Path)
+}
 
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		IdleConnTimeout:       30 * time.Second,
+func isWakePath(path string) bool {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 5 {
+		return false
 	}
-	client := &http.Client{Transport: transport, Timeout: timeout}
 
-	// Basic health endpoints
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	return parts[0] == "kubernetes" &&
+		parts[1] == "project" &&
+		parts[2] != "" &&
+		parts[3] == "virtualcluster" &&
+		parts[4] != ""
+}
 
-	// Catch-all proxy
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+func isRetryableWakeError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return isRetryableWakeError(urlErr.Err)
+	}
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return isRetryableWakeError(opErr.Err)
+	}
+
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.ECONNRESET
+	}
+
+	return strings.Contains(strings.ToLower(err.Error()), "server closed idle connection")
+}
+
+func writeAcceptedWakeResponse(w http.ResponseWriter, note string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":       true,
+		"accepted": true,
+		"note":     note,
+	})
+}
+
+func newProxyHandler(upstream string, client *http.Client, successOn map[int]struct{}, successOnError bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		targetURL := strings.TrimRight(upstream, "/") + r.URL.Path
 		if r.URL.RawQuery != "" {
 			targetURL += "?" + r.URL.RawQuery
@@ -101,28 +141,25 @@ func main() {
 
 		resp, err := client.Do(req)
 		if err != nil {
-		    // Treat transport/timeouts as success if enabled
-		    if successOnError {
-		        log.Printf("upstream %s error (%v) treated as success", targetURL, err)
-		        w.Header().Set("Content-Type", "application/json")
-		        w.WriteHeader(http.StatusOK)
-		        _, _ = w.Write([]byte(`{"ok":true,"note":"transport error treated as success"}`))
-		        return
-		    }
-		    // default: propagate as 502 so caller may retry
-		    http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
-		    return
+			log.Printf("upstream %s %s error: %v", r.Method, targetURL, err)
+			if successOnError && isWakeRequest(r) && isRetryableWakeError(err) {
+				log.Printf("wake request %s error (%v) treated as accepted", targetURL, err)
+				writeAcceptedWakeResponse(w, "wake request likely initiated; retryable upstream transport error treated as accepted")
+				return
+			}
+
+			// default: propagate as 502 so caller may retry
+			http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+			return
 		}
 		defer resp.Body.Close()
 
-		// If status is in SUCCESS_ON, swallow it and return 200
-		if _, ok := successOn[resp.StatusCode]; ok {
-      		log.Printf("upstream %s → %d (treated as success)", targetURL, resp.StatusCode)
-			// drain body (optional)
+		log.Printf("upstream %s %s -> %s", r.Method, targetURL, resp.Status)
+
+		if _, ok := successOn[resp.StatusCode]; ok && isWakeRequest(r) {
+			log.Printf("wake request %s → %d (treated as accepted)", targetURL, resp.StatusCode)
 			_, _ = io.Copy(io.Discard, resp.Body)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"ok":true,"note":"status ` + resp.Status + ` treated as success"}`))
+			writeAcceptedWakeResponse(w, "wake request likely initiated; retryable upstream status treated as accepted")
 			return
 		}
 
@@ -138,7 +175,37 @@ func main() {
 			// non-fatal
 			log.Printf("stream error: %v", err)
 		}
-	})
+	}
+}
+
+func main() {
+	upstream := os.Getenv("UPSTREAM_BASE") // e.g. https://romeo.us.demo.dev
+	if upstream == "" {
+		log.Fatal("UPSTREAM_BASE is required")
+	}
+	successOn := parseOverrideSet(mustEnv("SUCCESS_ON", "502,504"))
+	addr := mustEnv("LISTEN_ADDR", ":8080")
+	timeout := time.Duration(10) * time.Second
+	if t := os.Getenv("UPSTREAM_TIMEOUT"); t != "" {
+		if d, err := time.ParseDuration(t); err == nil {
+			timeout = d
+		}
+	}
+	successOnError := mustEnv("SUCCESS_ON_ERROR", "false") == "true"
+
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	}
+	client := &http.Client{Transport: transport, Timeout: timeout}
+
+	// Basic health endpoints
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+
+	http.HandleFunc("/", newProxyHandler(upstream, client, successOn, successOnError))
 
 	dump := mustEnv("LOG_REQUESTS", "false") == "true"
 	if dump {
@@ -152,7 +219,7 @@ func main() {
 		})
 	}
 
-	log.Printf("proxy listening on %s → upstream %s (success on: %v, timeout: %s)",
-		addr, upstream, successOn, timeout)
+	log.Printf("proxy listening on %s → upstream %s (wake success on: %v, wake success on transport error: %v, timeout: %s)",
+		addr, upstream, successOn, successOnError, timeout)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
