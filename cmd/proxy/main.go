@@ -111,6 +111,7 @@ func newProxyHandler(upstream string, client *http.Client, successOn map[int]str
 		if r.URL.RawQuery != "" {
 			targetURL += "?" + r.URL.RawQuery
 		}
+		wakeRequest := isWakeRequest(r)
 
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 		if err != nil {
@@ -142,7 +143,7 @@ func newProxyHandler(upstream string, client *http.Client, successOn map[int]str
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("upstream %s %s error: %v", r.Method, targetURL, err)
-			if successOnError && isWakeRequest(r) && isRetryableWakeError(err) {
+			if successOnError && wakeRequest && isRetryableWakeError(err) {
 				log.Printf("wake request %s error (%v) treated as accepted", targetURL, err)
 				writeAcceptedWakeResponse(w, "wake request likely initiated; retryable upstream transport error treated as accepted")
 				return
@@ -156,10 +157,16 @@ func newProxyHandler(upstream string, client *http.Client, successOn map[int]str
 
 		log.Printf("upstream %s %s -> %s", r.Method, targetURL, resp.Status)
 
-		if _, ok := successOn[resp.StatusCode]; ok && isWakeRequest(r) {
+		if _, ok := successOn[resp.StatusCode]; ok && wakeRequest {
 			log.Printf("wake request %s → %d (treated as accepted)", targetURL, resp.StatusCode)
 			_, _ = io.Copy(io.Discard, resp.Body)
 			writeAcceptedWakeResponse(w, "wake request likely initiated; retryable upstream status treated as accepted")
+			return
+		}
+		if wakeRequest && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted) {
+			log.Printf("wake request %s → %d (rewritten as accepted JSON)", targetURL, resp.StatusCode)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			writeAcceptedWakeResponse(w, "wake request accepted")
 			return
 		}
 

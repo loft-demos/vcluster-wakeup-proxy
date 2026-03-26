@@ -43,6 +43,54 @@ func TestWakeRequestTreatsConfiguredStatusAsAccepted(t *testing.T) {
 	}
 }
 
+func TestWakeRequestRewritesSuccessfulResponseAsAcceptedJSON(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		status     string
+	}{
+		{name: "200 OK", statusCode: http.StatusOK, status: "200 OK"},
+		{name: "202 Accepted", statusCode: http.StatusAccepted, status: "202 Accepted"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
+				header := make(http.Header)
+				header.Set("Content-Type", "application/json")
+				header.Set("X-Upstream", "set")
+				return &http.Response{
+					StatusCode: tt.statusCode,
+					Status:     tt.status,
+					Header:     header,
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}), parseOverrideSet("502,504"), false)
+
+			req := httptest.NewRequest(http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a", nil)
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected synthetic 200, got %d", rec.Code)
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("expected synthetic JSON content type, got %q", got)
+			}
+			if got := rec.Header().Get("X-Upstream"); got != "" {
+				t.Fatalf("expected upstream headers to be discarded, got %q", got)
+			}
+			if !strings.Contains(rec.Body.String(), `"accepted":true`) {
+				t.Fatalf("expected accepted response body, got %q", rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), `"note":"wake request accepted"`) {
+				t.Fatalf("expected wake success note, got %q", rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestNonWakeRequestPassesConfiguredStatusThrough(t *testing.T) {
 	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -63,6 +111,35 @@ func TestNonWakeRequestPassesConfiguredStatusThrough(t *testing.T) {
 	}
 	if rec.Body.String() != "timeout" {
 		t.Fatalf("expected upstream body to pass through, got %q", rec.Body.String())
+	}
+}
+
+func TestNonWakeRequestPassesSuccessfulResponseThrough(t *testing.T) {
+	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Content-Type", "application/json")
+		header.Set("X-Upstream", "set")
+		return &http.Response{
+			StatusCode: http.StatusAccepted,
+			Status:     "202 Accepted",
+			Header:     header,
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	}), parseOverrideSet("502,504"), false)
+
+	req := httptest.NewRequest(http.MethodGet, "/kubernetes/project/demo/virtualcluster/team-a", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Upstream"); got != "set" {
+		t.Fatalf("expected upstream headers to pass through, got %q", got)
+	}
+	if rec.Body.String() != "" {
+		t.Fatalf("expected empty upstream body to pass through, got %q", rec.Body.String())
 	}
 }
 

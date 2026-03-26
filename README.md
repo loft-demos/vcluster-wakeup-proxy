@@ -2,7 +2,7 @@
 
 `vcluster-wakeup-proxy` is a small HTTP proxy for forwarding requests to a vCluster Platform upstream while handling sleeping virtual cluster wake requests more gracefully.
 
-Its main job is to sit in front of the upstream API and treat the wake-triggering request as "accepted" when the request likely started the wake-up flow, even if the upstream returns a transient `502` or `504`, or a retryable early transport error.
+Its main job is to sit in front of the upstream API and treat the wake-triggering request as "accepted" when the request likely started the wake-up flow, including when the upstream returns `200 OK` or `202 Accepted` with an empty body, a transient `502` or `504`, or a retryable early transport error.
 
 This is useful for flows where:
 
@@ -17,6 +17,7 @@ The proxy does not blindly hide real problems. Permanent upstream responses such
 - Proxies all requests to `UPSTREAM_BASE`
 - Exposes `GET /healthz` and `GET /readyz`
 - Logs upstream transport errors and upstream response statuses
+- Rewrites wake-path upstream `200 OK` and `202 Accepted` responses to a small JSON acknowledgment
 - Treats configured retryable statuses as accepted only for wake requests
 - Optionally treats retryable wake-path transport errors as accepted when `SUCCESS_ON_ERROR=true`
 
@@ -64,4 +65,4 @@ env:
     value: "true"
 ```
 
-With that configuration, a wake-triggering `POST /kubernetes/project/.../virtualcluster/...` request will be treated as accepted if the upstream responds with `502` or `504`, or if it fails with a retryable early transport error. Other requests still pass through normally.
+With that configuration, a wake-triggering `POST /kubernetes/project/.../virtualcluster/...` request will be treated as accepted if the upstream responds with `200`, `202`, `502`, or `504`, or if it fails with a retryable early transport error. Other requests still pass through normally.
