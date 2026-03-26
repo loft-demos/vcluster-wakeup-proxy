@@ -44,6 +44,36 @@ func parseOverrideSet(v string) map[int]struct{} {
 	return set
 }
 
+func parseList(v string) []string {
+	if v == "" {
+		return nil
+	}
+
+	var items []string
+	for _, s := range strings.Split(v, ",") {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" {
+			continue
+		}
+		items = append(items, s)
+	}
+	return items
+}
+
+func shouldDumpRequest(r *http.Request, skippedUserAgents []string) bool {
+	if len(skippedUserAgents) == 0 {
+		return true
+	}
+
+	userAgent := strings.ToLower(strings.TrimSpace(r.UserAgent()))
+	for _, prefix := range skippedUserAgents {
+		if strings.HasPrefix(userAgent, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
 func isWakeRequest(r *http.Request) bool {
 	return r.Method == http.MethodPost && isWakePath(r.URL.Path)
 }
@@ -215,18 +245,28 @@ func main() {
 	http.HandleFunc("/", newProxyHandler(upstream, client, successOn, successOnError))
 
 	dump := mustEnv("LOG_REQUESTS", "false") == "true"
+	skippedDumpUserAgents := parseList(mustEnv("LOG_REQUESTS_SKIP_USER_AGENTS", "kube-probe"))
 	if dump {
 		orig := http.DefaultServeMux
 		http.DefaultServeMux = http.NewServeMux()
 		http.DefaultServeMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if b, err := httputil.DumpRequest(r, true); err == nil {
-				log.Printf("REQ:\n%s\n", string(b))
+			if shouldDumpRequest(r, skippedDumpUserAgents) {
+				if b, err := httputil.DumpRequest(r, true); err == nil {
+					log.Printf("REQ:\n%s\n", string(b))
+				}
 			}
 			orig.ServeHTTP(w, r)
 		})
 	}
 
-	log.Printf("proxy listening on %s → upstream %s (wake success on: %v, wake success on transport error: %v, timeout: %s)",
-		addr, upstream, successOn, successOnError, timeout)
+	log.Printf(
+		"proxy listening on %s → upstream %s (wake success on: %v, wake success on transport error: %v, timeout: %s, request log skip user agents: %v)",
+		addr,
+		upstream,
+		successOn,
+		successOnError,
+		timeout,
+		skippedDumpUserAgents,
+	)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }

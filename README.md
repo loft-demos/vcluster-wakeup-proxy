@@ -50,6 +50,7 @@ Only that request shape gets the special "accepted" handling.
 | `SUCCESS_ON` | `502,504` | Comma-separated upstream status codes that should be treated as accepted for wake requests |
 | `SUCCESS_ON_ERROR` | `false` | When `true`, retryable wake-path transport failures are also treated as accepted |
 | `LOG_REQUESTS` | `false` | When `true`, dumps full incoming requests to the log |
+| `LOG_REQUESTS_SKIP_USER_AGENTS` | `kube-probe` | Comma-separated User-Agent prefixes that should be excluded from request dump logging |
 
 Supported `SUCCESS_ON` values are `429`, `500`, `502`, and `504`.
 

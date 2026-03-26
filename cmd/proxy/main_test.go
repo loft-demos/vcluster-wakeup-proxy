@@ -20,6 +20,38 @@ func newTestClient(fn roundTripFunc) *http.Client {
 	return &http.Client{Transport: fn}
 }
 
+func TestShouldDumpRequestSkipsConfiguredUserAgents(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	req.Header.Set("User-Agent", "kube-probe/1.33")
+
+	if shouldDumpRequest(req, parseList("kube-probe")) {
+		t.Fatal("expected kube-probe request to be skipped")
+	}
+}
+
+func TestShouldDumpRequestAllowsOtherUserAgents(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	req.Header.Set("User-Agent", "curl/8.7.1")
+
+	if !shouldDumpRequest(req, parseList("kube-probe")) {
+		t.Fatal("expected non-probe request to be logged")
+	}
+}
+
+func TestParseListTrimsAndNormalizesEntries(t *testing.T) {
+	got := parseList(" kube-probe , Prometheus ")
+	want := []string{"kube-probe", "prometheus"}
+
+	if len(got) != len(want) {
+		t.Fatalf("expected %d items, got %d (%v)", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected %v, got %v", want, got)
+		}
+	}
+}
+
 func TestWakeRequestTreatsConfiguredStatusAsAccepted(t *testing.T) {
 	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
