@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -8,12 +9,23 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+type recordingWakeAction struct {
+	calls []wakeRequestInfo
+	err   error
+}
+
+func (a *recordingWakeAction) Execute(wake wakeRequestInfo) error {
+	a.calls = append(a.calls, wake)
+	return a.err
 }
 
 func newTestClient(fn roundTripFunc) *http.Client {
@@ -52,7 +64,8 @@ func TestParseListTrimsAndNormalizesEntries(t *testing.T) {
 	}
 }
 
-func TestWakeRequestTreatsConfiguredStatusAsAccepted(t *testing.T) {
+func TestWakeRequestTreatsConfiguredStatusAsAcceptedAndRunsAction(t *testing.T) {
+	action := &recordingWakeAction{}
 	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusGatewayTimeout,
@@ -60,7 +73,7 @@ func TestWakeRequestTreatsConfiguredStatusAsAccepted(t *testing.T) {
 			Header:     make(http.Header),
 			Body:       io.NopCloser(strings.NewReader("timeout")),
 		}, nil
-	}), parseOverrideSet("502,504"), false)
+	}), parseOverrideSet("502,504"), false, action)
 
 	req := httptest.NewRequest(http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a", nil)
 	rec := httptest.NewRecorder()
@@ -72,6 +85,12 @@ func TestWakeRequestTreatsConfiguredStatusAsAccepted(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"accepted":true`) {
 		t.Fatalf("expected accepted response body, got %q", rec.Body.String())
+	}
+	if len(action.calls) != 1 {
+		t.Fatalf("expected one wake action call, got %d", len(action.calls))
+	}
+	if action.calls[0] != (wakeRequestInfo{Project: "demo", VirtualCluster: "team-a"}) {
+		t.Fatalf("unexpected wake action call: %#v", action.calls[0])
 	}
 }
 
@@ -97,7 +116,7 @@ func TestWakeRequestRewritesSuccessfulResponseAsAcceptedJSON(t *testing.T) {
 					Header:     header,
 					Body:       io.NopCloser(strings.NewReader("")),
 				}, nil
-			}), parseOverrideSet("502,504"), false)
+			}), parseOverrideSet("502,504"), false, nil)
 
 			req := httptest.NewRequest(http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a", nil)
 			rec := httptest.NewRecorder()
@@ -123,7 +142,8 @@ func TestWakeRequestRewritesSuccessfulResponseAsAcceptedJSON(t *testing.T) {
 	}
 }
 
-func TestNonWakeRequestPassesConfiguredStatusThrough(t *testing.T) {
+func TestNonWakeRequestPassesConfiguredStatusThroughAndSkipsAction(t *testing.T) {
+	action := &recordingWakeAction{}
 	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusGatewayTimeout,
@@ -131,7 +151,7 @@ func TestNonWakeRequestPassesConfiguredStatusThrough(t *testing.T) {
 			Header:     make(http.Header),
 			Body:       io.NopCloser(strings.NewReader("timeout")),
 		}, nil
-	}), parseOverrideSet("502,504"), false)
+	}), parseOverrideSet("502,504"), false, action)
 
 	req := httptest.NewRequest(http.MethodGet, "/kubernetes/project/demo/virtualcluster/team-a", nil)
 	rec := httptest.NewRecorder()
@@ -143,6 +163,9 @@ func TestNonWakeRequestPassesConfiguredStatusThrough(t *testing.T) {
 	}
 	if rec.Body.String() != "timeout" {
 		t.Fatalf("expected upstream body to pass through, got %q", rec.Body.String())
+	}
+	if len(action.calls) != 0 {
+		t.Fatalf("expected no wake action calls, got %d", len(action.calls))
 	}
 }
 
@@ -157,7 +180,7 @@ func TestNonWakeRequestPassesSuccessfulResponseThrough(t *testing.T) {
 			Header:     header,
 			Body:       io.NopCloser(strings.NewReader("")),
 		}, nil
-	}), parseOverrideSet("502,504"), false)
+	}), parseOverrideSet("502,504"), false, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/kubernetes/project/demo/virtualcluster/team-a", nil)
 	rec := httptest.NewRecorder()
@@ -175,7 +198,8 @@ func TestNonWakeRequestPassesSuccessfulResponseThrough(t *testing.T) {
 	}
 }
 
-func TestWakeRequestKeepsPermanentErrorsVisible(t *testing.T) {
+func TestWakeRequestKeepsPermanentErrorsVisibleAndSkipsAction(t *testing.T) {
+	action := &recordingWakeAction{}
 	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusForbidden,
@@ -183,7 +207,7 @@ func TestWakeRequestKeepsPermanentErrorsVisible(t *testing.T) {
 			Header:     make(http.Header),
 			Body:       io.NopCloser(strings.NewReader("forbidden")),
 		}, nil
-	}), parseOverrideSet("502,504"), true)
+	}), parseOverrideSet("502,504"), true, action)
 
 	req := httptest.NewRequest(http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a", nil)
 	rec := httptest.NewRecorder()
@@ -196,12 +220,15 @@ func TestWakeRequestKeepsPermanentErrorsVisible(t *testing.T) {
 	if rec.Body.String() != "forbidden" {
 		t.Fatalf("expected upstream body to pass through, got %q", rec.Body.String())
 	}
+	if len(action.calls) != 0 {
+		t.Fatalf("expected no wake action calls, got %d", len(action.calls))
+	}
 }
 
 func TestWakeRequestTreatsRetryableTransportErrorAsAccepted(t *testing.T) {
 	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
 		return nil, &url.Error{Op: "Post", URL: "http://upstream", Err: io.ErrUnexpectedEOF}
-	}), parseOverrideSet("502,504"), true)
+	}), parseOverrideSet("502,504"), true, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a", nil)
 	rec := httptest.NewRecorder()
@@ -216,10 +243,34 @@ func TestWakeRequestTreatsRetryableTransportErrorAsAccepted(t *testing.T) {
 	}
 }
 
+func TestWakeRequestActionFailureStillReturnsAccepted(t *testing.T) {
+	action := &recordingWakeAction{err: errors.New("boom")}
+	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusAccepted,
+			Status:     "202 Accepted",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	}), parseOverrideSet("502,504"), false, action)
+
+	req := httptest.NewRequest(http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if len(action.calls) != 1 {
+		t.Fatalf("expected one wake action call, got %d", len(action.calls))
+	}
+}
+
 func TestWakeRequestDoesNotHideNonRetryableTransportError(t *testing.T) {
 	handler := newProxyHandler("http://upstream", newTestClient(func(*http.Request) (*http.Response, error) {
 		return nil, &url.Error{Op: "Post", URL: "http://upstream", Err: errors.New("no such host")}
-	}), parseOverrideSet("502,504"), true)
+	}), parseOverrideSet("502,504"), true, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a", nil)
 	rec := httptest.NewRecorder()
@@ -231,5 +282,70 @@ func TestWakeRequestDoesNotHideNonRetryableTransportError(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "no such host") {
 		t.Fatalf("expected transport error to be visible, got %q", rec.Body.String())
+	}
+}
+
+func TestArgoClusterSecretRefreshActionPatchesExpectedSecret(t *testing.T) {
+	var gotMethod string
+	var gotPath string
+	var gotAuth string
+	var gotContentType string
+	var gotPatch map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotContentType = r.Header.Get("Content-Type")
+
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&gotPatch); err != nil {
+			t.Fatalf("decode patch body: %v", err)
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	action := &argoClusterSecretRefreshAction{
+		client:             server.Client(),
+		apiBase:            server.URL,
+		bearerToken:        "test-token",
+		namespace:          "argocd",
+		secretNameTemplate: "loft-{project}-vcluster-{virtualcluster}",
+	}
+
+	err := action.Execute(wakeRequestInfo{Project: "demos", VirtualCluster: "jf-demo"})
+	if err != nil {
+		t.Fatalf("expected refresh patch to succeed, got %v", err)
+	}
+
+	if gotMethod != http.MethodPatch {
+		t.Fatalf("expected PATCH, got %q", gotMethod)
+	}
+	if gotPath != "/api/v1/namespaces/argocd/secrets/loft-demos-vcluster-jf-demo" {
+		t.Fatalf("unexpected patch path: %q", gotPath)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Fatalf("unexpected auth header: %q", gotAuth)
+	}
+	if gotContentType != "application/merge-patch+json" {
+		t.Fatalf("unexpected content type: %q", gotContentType)
+	}
+
+	metadata, ok := gotPatch["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected metadata object, got %#v", gotPatch["metadata"])
+	}
+	annotations, ok := metadata["annotations"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected annotations object, got %#v", metadata["annotations"])
+	}
+	rawTimestamp, ok := annotations[argocdClusterRefreshAnnotation].(string)
+	if !ok || rawTimestamp == "" {
+		t.Fatalf("expected refresh annotation timestamp, got %#v", annotations[argocdClusterRefreshAnnotation])
+	}
+	if _, err := time.Parse(time.RFC3339Nano, rawTimestamp); err != nil {
+		t.Fatalf("expected RFC3339 timestamp, got %q (%v)", rawTimestamp, err)
 	}
 }

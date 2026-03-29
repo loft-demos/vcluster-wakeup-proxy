@@ -4,6 +4,8 @@
 
 Its main job is to sit in front of the upstream API and treat the wake-triggering request as "accepted" when the request likely started the wake-up flow, including when the upstream returns `200 OK` or `202 Accepted` with an empty body, a transient `502` or `504`, or a retryable early transport error.
 
+It can also, after a wake request has been accepted, patch the matching Argo CD cluster secret with a fresh `argocd.argoproj.io/refresh` timestamp so Argo invalidates its destination-cluster cache sooner.
+
 This is useful for flows where:
 
 - `POST /kubernetes/project/<project>/virtualcluster/<name>` triggers a wake-up
@@ -20,6 +22,7 @@ The proxy does not blindly hide real problems. Permanent upstream responses such
 - Rewrites wake-path upstream `200 OK` and `202 Accepted` responses to a small JSON acknowledgment
 - Treats configured retryable statuses as accepted only for wake requests
 - Optionally treats retryable wake-path transport errors as accepted when `SUCCESS_ON_ERROR=true`
+- Optionally patches an Argo CD cluster secret after an accepted wake request to hint that Argo should refresh its cluster cache
 
 When a wake request is treated as accepted, the proxy returns `200 OK` with a small JSON body like:
 
@@ -51,8 +54,17 @@ Only that request shape gets the special "accepted" handling.
 | `SUCCESS_ON_ERROR` | `false` | When `true`, retryable wake-path transport failures are also treated as accepted |
 | `LOG_REQUESTS` | `false` | When `true`, dumps full incoming requests to the log |
 | `LOG_REQUESTS_SKIP_USER_AGENTS` | `kube-probe` | Comma-separated User-Agent prefixes that should be excluded from request dump logging |
+| `ARGOCD_CLUSTER_REFRESH_SECRET_NAMESPACE` | none | Enables post-wake Argo cluster refresh and sets the namespace of the target cluster secret |
+| `ARGOCD_CLUSTER_REFRESH_SECRET_NAME` | none | Exact Argo cluster secret name to patch after an accepted wake request |
+| `ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE` | none | Template for the Argo cluster secret name. Supports `{project}` and `{virtualcluster}` |
+| `ARGOCD_CLUSTER_REFRESH_TIMEOUT` | `5s` | Timeout for the Argo cluster secret patch request |
+| `ARGOCD_CLUSTER_REFRESH_KUBERNETES_API` | auto | Optional Kubernetes API base URL. Defaults to the in-cluster API from `KUBERNETES_SERVICE_HOST` |
+| `ARGOCD_CLUSTER_REFRESH_TOKEN_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Bearer token used for the secret patch request |
+| `ARGOCD_CLUSTER_REFRESH_CA_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | Cluster CA bundle used when `ARGOCD_CLUSTER_REFRESH_KUBERNETES_API` is `https://...` |
 
 Supported `SUCCESS_ON` values are `429`, `500`, `502`, and `504`.
+
+To enable the Argo refresh step, set `ARGOCD_CLUSTER_REFRESH_SECRET_NAMESPACE` and exactly one of `ARGOCD_CLUSTER_REFRESH_SECRET_NAME` or `ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE`.
 
 ## Example
 
@@ -64,6 +76,35 @@ env:
     value: "502,504"
   - name: SUCCESS_ON_ERROR
     value: "true"
+  - name: ARGOCD_CLUSTER_REFRESH_SECRET_NAMESPACE
+    value: "argocd"
+  - name: ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE
+    value: "loft-{project}-vcluster-{virtualcluster}"
 ```
 
-With that configuration, a wake-triggering `POST /kubernetes/project/.../virtualcluster/...` request will be treated as accepted if the upstream responds with `200`, `202`, `502`, or `504`, or if it fails with a retryable early transport error. Other requests still pass through normally.
+With that configuration, a wake-triggering `POST /kubernetes/project/.../virtualcluster/...` request will be treated as accepted if the upstream responds with `200`, `202`, `502`, or `504`, or if it fails with a retryable early transport error. After that accepted wake path, the proxy also patches the Argo CD cluster secret annotation `argocd.argoproj.io/refresh` with the current UTC timestamp.
+
+## Argo CD Cache Refresh Notes
+
+- The secret refresh step is best-effort. The proxy still returns the accepted wake response even if the patch fails, and logs the refresh error for debugging.
+- Secret targeting can be static with `ARGOCD_CLUSTER_REFRESH_SECRET_NAME` or derived per request with `ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE`.
+- The templated name currently supports `{project}` and `{virtualcluster}` from the wake path `/kubernetes/project/<project>/virtualcluster/<name>`.
+- For vCluster Platform-managed Argo cluster secrets, the expected template is typically `loft-{project}-vcluster-{virtualcluster}`. For example, project `demos` plus vCluster `jf-demo` becomes `loft-demos-vcluster-jf-demo`.
+- The proxy patches the Kubernetes API directly, which keeps the implementation small and avoids a hard dependency on Argo's API surface.
+
+The service account used by the proxy needs permission to patch the target cluster secret. A minimal role looks like this:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vcluster-wakeup-proxy-argocd-refresh
+  namespace: argocd
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["loft-demos-vcluster-jf-demo"]
+    verbs: ["patch"]
+```
+
+If you use `ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE`, grant `patch` on the secret set that template can resolve to.
