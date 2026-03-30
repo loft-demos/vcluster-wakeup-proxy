@@ -178,6 +178,6 @@ Important watcher settings:
 | `WATCH_TOKEN_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Bearer token for watcher API calls |
 | `WATCH_CA_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | CA bundle for watcher API calls |
 
-The example watcher Deployment enables `WATCH_PATCH_APPLICATION_HEALTH=true` because that is the most visible setup in Argo CD. If you only want cluster-secret pause/unpause plus app refresh, remove that env var or set it to `false`.
+The example watcher Deployment keeps `WATCH_PATCH_APPLICATION_HEALTH=false` by default. That is the safest default because some Argo CD installs expose `Application` but do not enable the `applications/status` subresource. If you turn health patching on and the watcher detects that `/status` cannot be patched, it automatically disables that feature and continues managing cluster-secret pause/unpause plus app refresh.
 
 Build the watcher image with [Dockerfile.watcher](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/Dockerfile.watcher).

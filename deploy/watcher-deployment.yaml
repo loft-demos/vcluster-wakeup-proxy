@@ -38,7 +38,7 @@ spec:
             - name: WATCH_APPLICATION_NAME_LABEL
               value: "vclusterName"
             - name: WATCH_PATCH_APPLICATION_HEALTH
-              value: "true"
+              value: "false"
           resources:
             requests:
               cpu: 10m

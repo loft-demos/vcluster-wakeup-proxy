@@ -374,6 +374,15 @@ func (a *kubernetesAPI) listApplications(ctx context.Context, namespace, project
 	return out.Items, nil
 }
 
+func (a *kubernetesAPI) getApplication(ctx context.Context, namespace, name string) (*application, error) {
+	var out application
+	path := "/apis/argoproj.io/v1alpha1/namespaces/" + url.PathEscape(namespace) + "/applications/" + url.PathEscape(name)
+	if err := a.getJSON(ctx, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (a *kubernetesAPI) getSecret(ctx context.Context, namespace, name string) (*secret, error) {
 	var out secret
 	path := "/api/v1/namespaces/" + url.PathEscape(namespace) + "/secrets/" + url.PathEscape(name)
@@ -543,13 +552,42 @@ func applicationsNeedReadyRefresh(apps []application, cfg watcherConfig) bool {
 	return false
 }
 
-func patchApplicationsHealth(ctx context.Context, cfg watcherConfig, apps []application, status, message string) error {
+func disableApplicationHealthPatching(cfg *watcherConfig, reason string) {
+	if !cfg.patchApplicationHealth {
+		return
+	}
+	cfg.patchApplicationHealth = false
+	log.Printf("disabling application health patching: %s", reason)
+}
+
+func patchApplicationsHealth(ctx context.Context, cfg *watcherConfig, apps []application, status, message string) error {
 	for _, app := range apps {
 		if app.Status.Health.Status == status && app.Status.Health.Message == message {
 			continue
 		}
 
 		if err := cfg.api.patchApplicationHealth(ctx, cfg.argocdApplicationNamespace, app.Metadata.Name, status, message); err != nil {
+			var statusErr *apiStatusError
+			if errors.As(err, &statusErr) {
+				switch statusErr.StatusCode {
+				case http.StatusNotFound:
+					_, getErr := cfg.api.getApplication(ctx, cfg.argocdApplicationNamespace, app.Metadata.Name)
+					if getErr == nil {
+						disableApplicationHealthPatching(cfg, fmt.Sprintf("Application %s exists but /status patch returned 404; the Application CRD likely does not expose the status subresource in this cluster. Set WATCH_PATCH_APPLICATION_HEALTH=false to avoid this path entirely.", app.Metadata.Name))
+						return nil
+					}
+
+					var getStatusErr *apiStatusError
+					if errors.As(getErr, &getStatusErr) && getStatusErr.StatusCode == http.StatusNotFound {
+						log.Printf("application %s disappeared before health patch; skipping", app.Metadata.Name)
+						continue
+					}
+				case http.StatusForbidden, http.StatusMethodNotAllowed:
+					disableApplicationHealthPatching(cfg, fmt.Sprintf("status patch for Application %s failed with %s; check Argo CD CRD subresources and RBAC, or set WATCH_PATCH_APPLICATION_HEALTH=false.", app.Metadata.Name, statusErr.Status))
+					return nil
+				}
+			}
+
 			return fmt.Errorf("patch application %s health: %w", app.Metadata.Name, err)
 		}
 		log.Printf("set application %s health to %s (%s)", app.Metadata.Name, status, message)
@@ -558,7 +596,7 @@ func patchApplicationsHealth(ctx context.Context, cfg watcherConfig, apps []appl
 	return nil
 }
 
-func annotateApplicationsHardRefresh(ctx context.Context, cfg watcherConfig, apps []application) error {
+func annotateApplicationsHardRefresh(ctx context.Context, cfg *watcherConfig, apps []application) error {
 	for _, app := range apps {
 		if strings.TrimSpace(app.Metadata.Annotations[argocdClusterRefreshAnnotation]) == "hard" {
 			continue
@@ -573,7 +611,7 @@ func annotateApplicationsHardRefresh(ctx context.Context, cfg watcherConfig, app
 	return nil
 }
 
-func reconcileVCI(ctx context.Context, cfg watcherConfig, vci virtualClusterInstance) error {
+func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterInstance) error {
 	project := projectFromVCI(vci, cfg.projectNamespacePrefixes)
 	if project == "" {
 		log.Printf("skipping VCI %s/%s: unable to derive project from label %q or namespace prefixes %v", vci.Metadata.Namespace, vci.Metadata.Name, loftProjectLabel, cfg.projectNamespacePrefixes)
@@ -625,7 +663,7 @@ func reconcileVCI(ctx context.Context, cfg watcherConfig, vci virtualClusterInst
 			}
 		}
 	case vciStateReady:
-		readyTransition := secretPaused || applicationsNeedReadyRefresh(apps, cfg)
+		readyTransition := secretPaused || applicationsNeedReadyRefresh(apps, *cfg)
 
 		if clusterSecret != nil && secretPaused {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, false); err != nil {
@@ -646,7 +684,7 @@ func reconcileVCI(ctx context.Context, cfg watcherConfig, vci virtualClusterInst
 	return nil
 }
 
-func reconcileAll(ctx context.Context, cfg watcherConfig) error {
+func reconcileAll(ctx context.Context, cfg *watcherConfig) error {
 	vcis, err := cfg.api.listVirtualClusterInstances(ctx)
 	if err != nil {
 		return err
@@ -661,7 +699,7 @@ func reconcileAll(ctx context.Context, cfg watcherConfig) error {
 	return nil
 }
 
-func run(ctx context.Context, cfg watcherConfig) error {
+func run(ctx context.Context, cfg *watcherConfig) error {
 	if err := reconcileAll(ctx, cfg); err != nil {
 		log.Printf("initial reconcile failed: %v", err)
 	}
@@ -699,7 +737,7 @@ func main() {
 		cfg.patchApplicationHealth,
 	)
 
-	if err := run(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(ctx, &cfg); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
 }
