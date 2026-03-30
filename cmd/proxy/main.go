@@ -31,10 +31,12 @@ const (
 type wakeRequestInfo struct {
 	Project        string
 	VirtualCluster string
+	UpstreamURL    string
+	ForwardHeaders http.Header
 }
 
 type wakeAcceptedAction interface {
-	Execute(wake wakeRequestInfo) error
+	Execute(ctx context.Context, wake wakeRequestInfo) error
 }
 
 type argoClusterSecretRefreshAction struct {
@@ -44,6 +46,17 @@ type argoClusterSecretRefreshAction struct {
 	namespace          string
 	secretName         string
 	secretNameTemplate string
+}
+
+type readinessWaitAction struct {
+	client    *http.Client
+	timeout   time.Duration
+	interval  time.Duration
+	checkPath string
+}
+
+type compositeWakeAcceptedAction struct {
+	actions []wakeAcceptedAction
 }
 
 func mustEnv(key, def string) string {
@@ -101,6 +114,32 @@ func shouldDumpRequest(r *http.Request, skippedUserAgents []string) bool {
 		}
 	}
 	return true
+}
+
+func cloneForwardHeaders(src http.Header) http.Header {
+	dst := make(http.Header, len(src))
+	hopByHop := map[string]struct{}{
+		"Connection":          {},
+		"Proxy-Connection":    {},
+		"Keep-Alive":          {},
+		"Proxy-Authenticate":  {},
+		"Proxy-Authorization": {},
+		"Te":                  {},
+		"Trailer":             {},
+		"Transfer-Encoding":   {},
+		"Upgrade":             {},
+	}
+
+	for k, vv := range src {
+		if _, skip := hopByHop[http.CanonicalHeaderKey(k)]; skip {
+			continue
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
+
+	return dst
 }
 
 func parseWakeRequest(r *http.Request) (wakeRequestInfo, bool) {
@@ -183,6 +222,104 @@ func newClusterRefreshHTTPClient(apiBase, caPath string, timeout time.Duration) 
 	return &http.Client{Transport: transport, Timeout: timeout}, nil
 }
 
+func (a compositeWakeAcceptedAction) Execute(ctx context.Context, wake wakeRequestInfo) error {
+	for _, action := range a.actions {
+		if err := action.Execute(ctx, wake); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isRetryableReadinessStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *readinessWaitAction) readinessURL(wake wakeRequestInfo) string {
+	return strings.TrimRight(wake.UpstreamURL, "/") + "/" + strings.TrimLeft(a.checkPath, "/")
+}
+
+func (a *readinessWaitAction) Execute(ctx context.Context, wake wakeRequestInfo) error {
+	if a == nil || a.timeout <= 0 {
+		return nil
+	}
+
+	readinessURL := a.readinessURL(wake)
+	deadline := time.Now().Add(a.timeout)
+	startedAt := time.Now()
+	attempts := 0
+	var lastErr error
+
+	for {
+		attempts++
+
+		attemptCtx, cancel := context.WithDeadline(ctx, deadline)
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, readinessURL, nil)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("build readiness request: %w", err)
+		}
+		req.Header = cloneForwardHeaders(wake.ForwardHeaders)
+
+		resp, err := a.client.Do(req)
+		cancel()
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+				log.Printf("wake readiness check succeeded for project=%s virtualcluster=%s after %d attempt(s) in %s via %s", wake.Project, wake.VirtualCluster, attempts, time.Since(startedAt).Round(time.Millisecond), readinessURL)
+				return nil
+			}
+
+			lastErr = fmt.Errorf("readiness probe %s returned %s", readinessURL, resp.Status)
+			if !isRetryableReadinessStatus(resp.StatusCode) {
+				return lastErr
+			}
+		} else {
+			lastErr = fmt.Errorf("readiness probe %s failed: %w", readinessURL, err)
+			if !isRetryableWakeError(err) && !errors.Is(err, context.DeadlineExceeded) {
+				return lastErr
+			}
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+
+		wait := a.interval
+		if wait <= 0 {
+			wait = 2 * time.Second
+		}
+		if remaining := time.Until(deadline); wait > remaining {
+			wait = remaining
+		}
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("no readiness response received")
+	}
+	return fmt.Errorf("cluster did not become ready within %s: %w", a.timeout, lastErr)
+}
+
 func (a *argoClusterSecretRefreshAction) targetSecretName(wake wakeRequestInfo) string {
 	if a.secretName != "" {
 		return a.secretName
@@ -195,7 +332,7 @@ func (a *argoClusterSecretRefreshAction) targetSecretName(wake wakeRequestInfo) 
 	return replacer.Replace(a.secretNameTemplate)
 }
 
-func (a *argoClusterSecretRefreshAction) Execute(wake wakeRequestInfo) error {
+func (a *argoClusterSecretRefreshAction) Execute(ctx context.Context, wake wakeRequestInfo) error {
 	secretName := strings.TrimSpace(a.targetSecretName(wake))
 	if secretName == "" {
 		return errors.New("target cluster secret name resolved to empty string")
@@ -216,7 +353,7 @@ func (a *argoClusterSecretRefreshAction) Execute(wake wakeRequestInfo) error {
 		"/api/v1/namespaces/" + url.PathEscape(a.namespace) +
 		"/secrets/" + url.PathEscape(secretName)
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPatch, targetURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("build cluster refresh request: %w", err)
 	}
@@ -239,7 +376,43 @@ func (a *argoClusterSecretRefreshAction) Execute(wake wakeRequestInfo) error {
 	return nil
 }
 
-func newWakeAcceptedActionFromEnv() (wakeAcceptedAction, error) {
+func newReadinessWaitActionFromEnv(client *http.Client) (wakeAcceptedAction, error) {
+	timeoutValue := strings.TrimSpace(os.Getenv("WAKE_READY_TIMEOUT"))
+	if timeoutValue == "" {
+		return nil, nil
+	}
+
+	timeout, err := time.ParseDuration(timeoutValue)
+	if err != nil {
+		return nil, fmt.Errorf("parse WAKE_READY_TIMEOUT: %w", err)
+	}
+	if timeout <= 0 {
+		return nil, nil
+	}
+
+	interval := 2 * time.Second
+	if v := strings.TrimSpace(os.Getenv("WAKE_READY_INTERVAL")); v != "" {
+		parsedInterval, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("parse WAKE_READY_INTERVAL: %w", err)
+		}
+		interval = parsedInterval
+	}
+
+	checkPath := strings.TrimSpace(os.Getenv("WAKE_READY_PATH"))
+	if checkPath == "" {
+		checkPath = "/version"
+	}
+
+	return &readinessWaitAction{
+		client:    client,
+		timeout:   timeout,
+		interval:  interval,
+		checkPath: checkPath,
+	}, nil
+}
+
+func newArgoClusterRefreshActionFromEnv() (wakeAcceptedAction, error) {
 	namespace := strings.TrimSpace(os.Getenv("ARGOCD_CLUSTER_REFRESH_SECRET_NAMESPACE"))
 	secretName := strings.TrimSpace(os.Getenv("ARGOCD_CLUSTER_REFRESH_SECRET_NAME"))
 	secretNameTemplate := strings.TrimSpace(os.Getenv("ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE"))
@@ -301,6 +474,35 @@ func newWakeAcceptedActionFromEnv() (wakeAcceptedAction, error) {
 	}, nil
 }
 
+func newWakeAcceptedActionFromEnv(client *http.Client) (wakeAcceptedAction, error) {
+	var actions []wakeAcceptedAction
+
+	readinessAction, err := newReadinessWaitActionFromEnv(client)
+	if err != nil {
+		return nil, err
+	}
+	if readinessAction != nil {
+		actions = append(actions, readinessAction)
+	}
+
+	clusterRefreshAction, err := newArgoClusterRefreshActionFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if clusterRefreshAction != nil {
+		actions = append(actions, clusterRefreshAction)
+	}
+
+	switch len(actions) {
+	case 0:
+		return nil, nil
+	case 1:
+		return actions[0], nil
+	default:
+		return compositeWakeAcceptedAction{actions: actions}, nil
+	}
+}
+
 func isRetryableWakeError(err error) bool {
 	if err == nil {
 		return false
@@ -345,18 +547,18 @@ func writeAcceptedWakeResponse(w http.ResponseWriter, note string) {
 	})
 }
 
-func executeWakeAcceptedAction(action wakeAcceptedAction, wake wakeRequestInfo) {
+func executeWakeAcceptedAction(ctx context.Context, action wakeAcceptedAction, wake wakeRequestInfo) {
 	if action == nil {
 		return
 	}
 
-	if err := action.Execute(wake); err != nil {
+	if err := action.Execute(ctx, wake); err != nil {
 		log.Printf("accepted wake request for project=%s virtualcluster=%s, but post-wake action failed: %v", wake.Project, wake.VirtualCluster, err)
 	}
 }
 
-func writeAcceptedWake(w http.ResponseWriter, action wakeAcceptedAction, wake wakeRequestInfo, note string) {
-	executeWakeAcceptedAction(action, wake)
+func writeAcceptedWake(ctx context.Context, w http.ResponseWriter, action wakeAcceptedAction, wake wakeRequestInfo, note string) {
+	executeWakeAcceptedAction(ctx, action, wake)
 	writeAcceptedWakeResponse(w, note)
 }
 
@@ -367,40 +569,25 @@ func newProxyHandler(upstream string, client *http.Client, successOn map[int]str
 			targetURL += "?" + r.URL.RawQuery
 		}
 		wake, wakeRequest := parseWakeRequest(r)
+		forwardHeaders := cloneForwardHeaders(r.Header)
+		if wakeRequest {
+			wake.UpstreamURL = strings.TrimRight(upstream, "/") + r.URL.Path
+			wake.ForwardHeaders = forwardHeaders.Clone()
+		}
 
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 		if err != nil {
 			http.Error(w, "bad upstream request", http.StatusBadGateway)
 			return
 		}
-
-		// Copy headers (minus hop-by-hop)
-		hopByHop := map[string]struct{}{
-			"Connection":          {},
-			"Proxy-Connection":    {},
-			"Keep-Alive":          {},
-			"Proxy-Authenticate":  {},
-			"Proxy-Authorization": {},
-			"Te":                  {},
-			"Trailer":             {},
-			"Transfer-Encoding":   {},
-			"Upgrade":             {},
-		}
-		for k, vv := range r.Header {
-			if _, skip := hopByHop[http.CanonicalHeaderKey(k)]; skip {
-				continue
-			}
-			for _, v := range vv {
-				req.Header.Add(k, v)
-			}
-		}
+		req.Header = forwardHeaders.Clone()
 
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("upstream %s %s error: %v", r.Method, targetURL, err)
 			if successOnError && wakeRequest && isRetryableWakeError(err) {
 				log.Printf("wake request %s error (%v) treated as accepted", targetURL, err)
-				writeAcceptedWake(w, action, wake, "wake request likely initiated; retryable upstream transport error treated as accepted")
+				writeAcceptedWake(r.Context(), w, action, wake, "wake request likely initiated; retryable upstream transport error treated as accepted")
 				return
 			}
 
@@ -414,13 +601,13 @@ func newProxyHandler(upstream string, client *http.Client, successOn map[int]str
 		if _, ok := successOn[resp.StatusCode]; ok && wakeRequest {
 			log.Printf("wake request %s -> %d (treated as accepted)", targetURL, resp.StatusCode)
 			_, _ = io.Copy(io.Discard, resp.Body)
-			writeAcceptedWake(w, action, wake, "wake request likely initiated; retryable upstream status treated as accepted")
+			writeAcceptedWake(r.Context(), w, action, wake, "wake request likely initiated; retryable upstream status treated as accepted")
 			return
 		}
 		if wakeRequest && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted) {
 			log.Printf("wake request %s -> %d (rewritten as accepted JSON)", targetURL, resp.StatusCode)
 			_, _ = io.Copy(io.Discard, resp.Body)
-			writeAcceptedWake(w, action, wake, "wake request accepted")
+			writeAcceptedWake(r.Context(), w, action, wake, "wake request accepted")
 			return
 		}
 
@@ -459,7 +646,7 @@ func main() {
 	}
 	client := &http.Client{Transport: transport, Timeout: timeout}
 
-	wakeAcceptedAction, err := newWakeAcceptedActionFromEnv()
+	wakeAcceptedAction, err := newWakeAcceptedActionFromEnv(client)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vcluster-wakeup-proxy
+  namespace: argocd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vcluster-wakeup-proxy-secret-patch
+  namespace: argocd
+rules:
+  # Template-based cluster secret names are hard to enumerate with resourceNames.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vcluster-wakeup-proxy-secret-patch
+  namespace: argocd
+subjects:
+  - kind: ServiceAccount
+    name: vcluster-wakeup-proxy
+    namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vcluster-wakeup-proxy-secret-patch

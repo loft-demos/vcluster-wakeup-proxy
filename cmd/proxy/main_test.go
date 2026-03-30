@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,7 +24,7 @@ type recordingWakeAction struct {
 	err   error
 }
 
-func (a *recordingWakeAction) Execute(wake wakeRequestInfo) error {
+func (a *recordingWakeAction) Execute(_ context.Context, wake wakeRequestInfo) error {
 	a.calls = append(a.calls, wake)
 	return a.err
 }
@@ -89,7 +90,7 @@ func TestWakeRequestTreatsConfiguredStatusAsAcceptedAndRunsAction(t *testing.T) 
 	if len(action.calls) != 1 {
 		t.Fatalf("expected one wake action call, got %d", len(action.calls))
 	}
-	if action.calls[0] != (wakeRequestInfo{Project: "demo", VirtualCluster: "team-a"}) {
+	if action.calls[0].Project != "demo" || action.calls[0].VirtualCluster != "team-a" {
 		t.Fatalf("unexpected wake action call: %#v", action.calls[0])
 	}
 }
@@ -285,6 +286,78 @@ func TestWakeRequestDoesNotHideNonRetryableTransportError(t *testing.T) {
 	}
 }
 
+func TestReadinessWaitActionPollsUntilReady(t *testing.T) {
+	attempts := 0
+	var gotAuth string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		gotAuth = r.Header.Get("Authorization")
+
+		if r.URL.Path != "/kubernetes/project/demos/virtualcluster/jf-demo/version" {
+			t.Fatalf("unexpected readiness path: %q", r.URL.Path)
+		}
+
+		if attempts == 1 {
+			http.Error(w, "waking", http.StatusServiceUnavailable)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"major":"1","minor":"31"}`))
+	}))
+	defer server.Close()
+
+	action := &readinessWaitAction{
+		client:    server.Client(),
+		timeout:   500 * time.Millisecond,
+		interval:  10 * time.Millisecond,
+		checkPath: "/version",
+	}
+
+	err := action.Execute(context.Background(), wakeRequestInfo{
+		Project:        "demos",
+		VirtualCluster: "jf-demo",
+		UpstreamURL:    server.URL + "/kubernetes/project/demos/virtualcluster/jf-demo",
+		ForwardHeaders: http.Header{"Authorization": {"Bearer test-token"}},
+	})
+	if err != nil {
+		t.Fatalf("expected readiness wait to succeed, got %v", err)
+	}
+	if attempts < 2 {
+		t.Fatalf("expected readiness probe to retry, got %d attempt(s)", attempts)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Fatalf("expected readiness probe to forward auth header, got %q", gotAuth)
+	}
+}
+
+func TestReadinessWaitActionReturnsErrorOnNonRetryableStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	action := &readinessWaitAction{
+		client:    server.Client(),
+		timeout:   200 * time.Millisecond,
+		interval:  10 * time.Millisecond,
+		checkPath: "/version",
+	}
+
+	err := action.Execute(context.Background(), wakeRequestInfo{
+		Project:        "demos",
+		VirtualCluster: "jf-demo",
+		UpstreamURL:    server.URL + "/kubernetes/project/demos/virtualcluster/jf-demo",
+	})
+	if err == nil {
+		t.Fatal("expected readiness wait to fail on non-retryable status")
+	}
+	if !strings.Contains(err.Error(), "403 Forbidden") {
+		t.Fatalf("expected 403 in readiness error, got %v", err)
+	}
+}
+
 func TestArgoClusterSecretRefreshActionPatchesExpectedSecret(t *testing.T) {
 	var gotMethod string
 	var gotPath string
@@ -315,7 +388,7 @@ func TestArgoClusterSecretRefreshActionPatchesExpectedSecret(t *testing.T) {
 		secretNameTemplate: "loft-{project}-vcluster-{virtualcluster}",
 	}
 
-	err := action.Execute(wakeRequestInfo{Project: "demos", VirtualCluster: "jf-demo"})
+	err := action.Execute(context.Background(), wakeRequestInfo{Project: "demos", VirtualCluster: "jf-demo"})
 	if err != nil {
 		t.Fatalf("expected refresh patch to succeed, got %v", err)
 	}
