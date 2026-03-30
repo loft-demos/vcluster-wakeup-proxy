@@ -17,7 +17,6 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: vcluster-wakeup-proxy
   REGISTRY: ghcr.io
   PLATFORMS: linux/amd64,linux/arm64
 
@@ -28,6 +27,14 @@ concurrency:
 jobs:
   build-push:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image_name: vcluster-wakeup-proxy
+            dockerfile: ./Dockerfile
+          - image_name: vcluster-wakeup-watcher
+            dockerfile: ./Dockerfile.watcher
 
     steps:
       - name: Checkout
@@ -51,7 +58,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image_name }}
           tags: |
             # latest on main
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
@@ -71,10 +78,10 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           platforms: ${{ env.PLATFORMS }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.image_name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}

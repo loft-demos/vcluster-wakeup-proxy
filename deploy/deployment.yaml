@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vcluster-wakeup-proxy
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: vcluster-wakeup-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vcluster-wakeup-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vcluster-wakeup-proxy
+    spec:
+      serviceAccountName: vcluster-wakeup-proxy
+      containers:
+        - name: proxy
+          image: ghcr.io/your-org/vcluster-wakeup-proxy:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: UPSTREAM_BASE
+              value: "https://quartz.us.demo.dev"
+            - name: SUCCESS_ON
+              value: "502,504"
+            - name: SUCCESS_ON_ERROR
+              value: "true"
+            - name: WAKE_READY_TIMEOUT
+              value: "30s"
+            - name: WAKE_READY_INTERVAL
+              value: "2s"
+            - name: ARGOCD_CLUSTER_REFRESH_SECRET_NAMESPACE
+              value: "argocd"
+            - name: ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE
+              value: "loft-{project}-vcluster-{virtualcluster}"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi

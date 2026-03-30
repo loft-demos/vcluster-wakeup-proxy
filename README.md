@@ -101,7 +101,14 @@ With that configuration, a wake-triggering `POST /kubernetes/project/.../virtual
 - For vCluster Platform-managed Argo cluster secrets, the expected template is typically `loft-{project}-vcluster-{virtualcluster}`. For example, project `demos` plus vCluster `jf-demo` becomes `loft-demos-vcluster-jf-demo`.
 - The proxy patches the Kubernetes API directly, which keeps the implementation small and avoids a hard dependency on Argo's API surface.
 
-The service account used by the proxy needs permission to patch the target cluster secret. A ready-to-apply manifest is included at [deploy/argocd-rbac.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/argocd-rbac.yaml).
+Ready-to-apply example manifests are included in [deploy/argocd-rbac.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/argocd-rbac.yaml), [deploy/deployment.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/deployment.yaml), and [deploy/service.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/service.yaml).
+
+Update the example Deployment before applying it:
+
+- Set the container `image` to the image you actually publish for this proxy
+- Set `UPSTREAM_BASE` to your vCluster Platform endpoint, for example `https://quartz.us.demo.dev`
+
+The service account used by the proxy needs permission to patch the target cluster secret.
 
 That manifest grants `patch` on Secrets in the `argocd` namespace, which is usually the practical choice when secret names are templated like `loft-{project}-vcluster-{virtualcluster}`.
 
@@ -130,3 +137,47 @@ rules:
 ```
 
 If you use `ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE`, grant `patch` on the secret set that template can resolve to.
+
+## Optional VCI Watcher
+
+The proxy and the watcher solve different parts of the sleeping-vCluster flow:
+
+- `cmd/proxy` handles the wake-triggering HTTP request and can wait for readiness before returning an accepted response
+- `cmd/watcher` continuously reconciles Argo CD behavior from `VirtualClusterInstance` state
+
+The watcher polls `VirtualClusterInstance` objects from the management cluster API and then:
+
+- derives the project from `metadata.labels["loft.sh/project"]` when present, otherwise from `metadata.namespace` using `WATCH_PROJECT_NAMESPACE_PREFIXES`
+- finds matching Argo CD `Application` objects by label using `WATCH_APPLICATION_PROJECT_LABEL` and `WATCH_APPLICATION_NAME_LABEL`
+- classifies the vCluster as `Sleeping`, `Waking`, `Ready`, or `Unknown`
+- patches the imported cluster Secret with `argocd.argoproj.io/skip-reconcile: "true"` while the vCluster is sleeping or waking
+- removes `skip-reconcile` and annotates matching apps with `argocd.argoproj.io/refresh: hard` once the vCluster is ready again
+- optionally patches `Application.status.health` while sleeping or waking when `WATCH_PATCH_APPLICATION_HEALTH=true`
+
+Sleep detection prefers the platform-managed annotations `sleepmode.loft.sh/sleeping-since` and `sleepmode.loft.sh/sleep-type`, then falls back to `status.phase`, `status.reason`, `status.message`, and the `VirtualClusterOnline` condition.
+
+Ready-to-apply example manifests are included in [deploy/watcher-rbac.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/watcher-rbac.yaml) and [deploy/watcher-deployment.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/watcher-deployment.yaml).
+
+Important watcher settings:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ARGOCD_CLUSTER_SECRET_NAME_TEMPLATE` | none | Required imported cluster Secret naming template. Supports `{project}` and `{virtualcluster}` |
+| `ARGOCD_NAMESPACE` | `argocd` | Default namespace for Argo CD resources |
+| `ARGOCD_APPLICATION_NAMESPACE` | `ARGOCD_NAMESPACE` | Namespace where matching `Application` objects live |
+| `ARGOCD_CLUSTER_SECRET_NAMESPACE` | `ARGOCD_NAMESPACE` | Namespace where imported cluster Secrets live |
+| `WATCH_POLL_INTERVAL` | `15s` | How often to poll `VirtualClusterInstance` objects |
+| `WATCH_PROJECT_NAMESPACE_PREFIXES` | `p-,loft-p-` | Namespace prefixes used when no `loft.sh/project` label is present |
+| `WATCH_APPLICATION_PROJECT_LABEL` | `vclusterProjectId` | Application label key for the project join |
+| `WATCH_APPLICATION_NAME_LABEL` | `vclusterName` | Application label key for the vCluster name join |
+| `WATCH_PATCH_APPLICATION_HEALTH` | `false` | When `true`, patches `Application.status.health` to `Suspended` or `Progressing` while Argo is paused |
+| `WATCH_SLEEPING_MESSAGE` | `vCluster sleeping` | Health message written when app health patching is enabled |
+| `WATCH_WAKING_MESSAGE` | `vCluster waking` | Health message written when app health patching is enabled |
+| `WATCH_KUBERNETES_API` | auto | Optional Kubernetes API base URL. Defaults to the in-cluster API |
+| `WATCH_KUBERNETES_TIMEOUT` | `10s` | Timeout for watcher Kubernetes API requests |
+| `WATCH_TOKEN_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Bearer token for watcher API calls |
+| `WATCH_CA_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | CA bundle for watcher API calls |
+
+The example watcher Deployment enables `WATCH_PATCH_APPLICATION_HEALTH=true` because that is the most visible setup in Argo CD. If you only want cluster-secret pause/unpause plus app refresh, remove that env var or set it to `false`.
+
+Build the watcher image with [Dockerfile.watcher](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/Dockerfile.watcher).
