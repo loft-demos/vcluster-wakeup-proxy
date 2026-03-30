@@ -55,9 +55,15 @@ type watcherConfig struct {
 	applicationProjectLabelKey   string
 	applicationNameLabelKey      string
 	patchApplicationHealth       bool
+	applicationHealthPatchMode   string
 	sleepingHealthMessage        string
 	wakingHealthMessage          string
 }
+
+const (
+	applicationHealthPatchModeStatus      = "status"
+	applicationHealthPatchModeApplication = "application"
+)
 
 type kubernetesAPI struct {
 	client      *http.Client
@@ -276,6 +282,7 @@ func loadWatcherConfig() (watcherConfig, error) {
 		applicationProjectLabelKey:   mustEnv("WATCH_APPLICATION_PROJECT_LABEL", "vclusterProjectId"),
 		applicationNameLabelKey:      mustEnv("WATCH_APPLICATION_NAME_LABEL", "vclusterName"),
 		patchApplicationHealth:       strings.EqualFold(mustEnv("WATCH_PATCH_APPLICATION_HEALTH", "false"), "true"),
+		applicationHealthPatchMode:   applicationHealthPatchModeStatus,
 		sleepingHealthMessage:        mustEnv("WATCH_SLEEPING_MESSAGE", "vCluster sleeping"),
 		wakingHealthMessage:          mustEnv("WATCH_WAKING_MESSAGE", "vCluster waking"),
 	}, nil
@@ -417,8 +424,19 @@ func (a *kubernetesAPI) patchApplicationRefresh(ctx context.Context, namespace, 
 	})
 }
 
-func (a *kubernetesAPI) patchApplicationHealth(ctx context.Context, namespace, name, status, message string) error {
+func (a *kubernetesAPI) patchApplicationHealthStatusSubresource(ctx context.Context, namespace, name, status, message string) error {
 	return a.mergePatch(ctx, "/apis/argoproj.io/v1alpha1/namespaces/"+url.PathEscape(namespace)+"/applications/"+url.PathEscape(name)+"/status", map[string]any{
+		"status": map[string]any{
+			"health": map[string]string{
+				"status":  status,
+				"message": message,
+			},
+		},
+	})
+}
+
+func (a *kubernetesAPI) patchApplicationHealthOnResource(ctx context.Context, namespace, name, status, message string) error {
+	return a.mergePatch(ctx, "/apis/argoproj.io/v1alpha1/namespaces/"+url.PathEscape(namespace)+"/applications/"+url.PathEscape(name), map[string]any{
 		"status": map[string]any{
 			"health": map[string]string{
 				"status":  status,
@@ -560,21 +578,41 @@ func disableApplicationHealthPatching(cfg *watcherConfig, reason string) {
 	log.Printf("disabling application health patching: %s", reason)
 }
 
+func patchApplicationHealth(ctx context.Context, cfg *watcherConfig, name, status, message string) error {
+	switch cfg.applicationHealthPatchMode {
+	case applicationHealthPatchModeApplication:
+		return cfg.api.patchApplicationHealthOnResource(ctx, cfg.argocdApplicationNamespace, name, status, message)
+	default:
+		return cfg.api.patchApplicationHealthStatusSubresource(ctx, cfg.argocdApplicationNamespace, name, status, message)
+	}
+}
+
 func patchApplicationsHealth(ctx context.Context, cfg *watcherConfig, apps []application, status, message string) error {
 	for _, app := range apps {
 		if app.Status.Health.Status == status && app.Status.Health.Message == message {
 			continue
 		}
 
-		if err := cfg.api.patchApplicationHealth(ctx, cfg.argocdApplicationNamespace, app.Metadata.Name, status, message); err != nil {
+		if err := patchApplicationHealth(ctx, cfg, app.Metadata.Name, status, message); err != nil {
 			var statusErr *apiStatusError
 			if errors.As(err, &statusErr) {
 				switch statusErr.StatusCode {
 				case http.StatusNotFound:
 					_, getErr := cfg.api.getApplication(ctx, cfg.argocdApplicationNamespace, app.Metadata.Name)
-					if getErr == nil {
-						disableApplicationHealthPatching(cfg, fmt.Sprintf("Application %s exists but /status patch returned 404; the Application CRD likely does not expose the status subresource in this cluster. Set WATCH_PATCH_APPLICATION_HEALTH=false to avoid this path entirely.", app.Metadata.Name))
-						return nil
+					if getErr == nil && cfg.applicationHealthPatchMode == applicationHealthPatchModeStatus {
+						cfg.applicationHealthPatchMode = applicationHealthPatchModeApplication
+						log.Printf("application %s exists but /status patch returned 404; falling back to patching status on the Application resource itself", app.Metadata.Name)
+
+						if fallbackErr := patchApplicationHealth(ctx, cfg, app.Metadata.Name, status, message); fallbackErr == nil {
+							log.Printf("set application %s health to %s (%s)", app.Metadata.Name, status, message)
+							continue
+						} else {
+							err = fallbackErr
+							if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusForbidden || statusErr.StatusCode == http.StatusMethodNotAllowed) {
+								disableApplicationHealthPatching(cfg, fmt.Sprintf("fallback status patch for Application %s failed with %s; check Argo CD RBAC, or set WATCH_PATCH_APPLICATION_HEALTH=false.", app.Metadata.Name, statusErr.Status))
+								return nil
+							}
+						}
 					}
 
 					var getStatusErr *apiStatusError
