@@ -33,10 +33,6 @@ spec:
               value: "2s"
             - name: WATCH_PROJECT_NAMESPACE_PREFIXES
               value: "p-,loft-p-"
-            - name: WATCH_APPLICATION_PROJECT_LABEL
-              value: "vclusterProjectId"
-            - name: WATCH_APPLICATION_NAME_LABEL
-              value: "vclusterName"
             - name: WATCH_PATCH_APPLICATION_HEALTH
               value: "true"
           resources:

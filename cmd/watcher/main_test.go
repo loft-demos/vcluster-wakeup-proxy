@@ -204,6 +204,38 @@ func TestApplicationsNeedReadyRefreshOnlyForManagedHealth(t *testing.T) {
 	}
 }
 
+func TestApplicationsByDestinationName(t *testing.T) {
+	apps := []application{
+		{
+			Metadata: metadata{Name: "guestbook-dev"},
+			Spec: applicationSpec{
+				Destination: applicationDestination{Name: "loft-default-vcluster-pd-dev"},
+			},
+		},
+		{
+			Metadata: metadata{Name: "guestbook-pre-prod"},
+			Spec: applicationSpec{
+				Destination: applicationDestination{Name: "loft-default-vcluster-pre-prod-gate-pre-prod"},
+			},
+		},
+		{
+			Metadata: metadata{Name: "guestbook-pre-prod-copy"},
+			Spec: applicationSpec{
+				Destination: applicationDestination{Name: "loft-default-vcluster-pre-prod-gate-pre-prod"},
+			},
+		},
+	}
+
+	indexed := applicationsByDestinationName(apps)
+
+	if got := len(indexed["loft-default-vcluster-pd-dev"]); got != 1 {
+		t.Fatalf("expected 1 app for pd-dev destination, got %d", got)
+	}
+	if got := len(indexed["loft-default-vcluster-pre-prod-gate-pre-prod"]); got != 2 {
+		t.Fatalf("expected 2 apps for pre-prod destination, got %d", got)
+	}
+}
+
 func TestClusterSecretNameTemplate(t *testing.T) {
 	got := clusterSecretName("loft-{project}-vcluster-{virtualcluster}", "demo", "team-a")
 	if got != "loft-demo-vcluster-team-a" {

@@ -52,8 +52,6 @@ type watcherConfig struct {
 	argocdClusterSecretNamespace string
 	clusterSecretNameTemplate    string
 	projectNamespacePrefixes     []string
-	applicationProjectLabelKey   string
-	applicationNameLabelKey      string
 	patchApplicationHealth       bool
 	applicationHealthPatchMode   string
 	sleepingHealthMessage        string
@@ -107,8 +105,17 @@ type applicationStatus struct {
 	Health healthStatus `json:"health"`
 }
 
+type applicationDestination struct {
+	Name string `json:"name"`
+}
+
+type applicationSpec struct {
+	Destination applicationDestination `json:"destination"`
+}
+
 type application struct {
 	Metadata metadata          `json:"metadata"`
+	Spec     applicationSpec   `json:"spec"`
 	Status   applicationStatus `json:"status"`
 }
 
@@ -279,8 +286,6 @@ func loadWatcherConfig() (watcherConfig, error) {
 		argocdClusterSecretNamespace: secretNamespace,
 		clusterSecretNameTemplate:    clusterSecretNameTemplate,
 		projectNamespacePrefixes:     projectNamespacePrefixes,
-		applicationProjectLabelKey:   mustEnv("WATCH_APPLICATION_PROJECT_LABEL", "vclusterProjectId"),
-		applicationNameLabelKey:      mustEnv("WATCH_APPLICATION_NAME_LABEL", "vclusterName"),
 		patchApplicationHealth:       strings.EqualFold(mustEnv("WATCH_PATCH_APPLICATION_HEALTH", "false"), "true"),
 		applicationHealthPatchMode:   applicationHealthPatchModeStatus,
 		sleepingHealthMessage:        mustEnv("WATCH_SLEEPING_MESSAGE", "vCluster sleeping"),
@@ -365,13 +370,11 @@ func (a *kubernetesAPI) listVirtualClusterInstances(ctx context.Context) ([]virt
 	return out.Items, nil
 }
 
-func (a *kubernetesAPI) listApplications(ctx context.Context, namespace, projectLabelKey, project, nameLabelKey, name string) ([]application, error) {
+func (a *kubernetesAPI) listApplications(ctx context.Context, namespace string) ([]application, error) {
 	var out listResponse[application]
-	query := url.Values{}
-	query.Set("labelSelector", fmt.Sprintf("%s=%s,%s=%s", projectLabelKey, project, nameLabelKey, name))
 
 	path := "/apis/argoproj.io/v1alpha1/namespaces/" + url.PathEscape(namespace) + "/applications"
-	if err := a.getJSON(ctx, path, query, &out); err != nil {
+	if err := a.getJSON(ctx, path, nil, &out); err != nil {
 		return nil, err
 	}
 
@@ -379,6 +382,18 @@ func (a *kubernetesAPI) listApplications(ctx context.Context, namespace, project
 		return out.Items[i].Metadata.Name < out.Items[j].Metadata.Name
 	})
 	return out.Items, nil
+}
+
+func applicationsByDestinationName(apps []application) map[string][]application {
+	indexed := make(map[string][]application)
+	for _, app := range apps {
+		destinationName := strings.TrimSpace(app.Spec.Destination.Name)
+		if destinationName == "" {
+			continue
+		}
+		indexed[destinationName] = append(indexed[destinationName], app)
+	}
+	return indexed
 }
 
 func (a *kubernetesAPI) getApplication(ctx context.Context, namespace, name string) (*application, error) {
@@ -649,19 +664,15 @@ func annotateApplicationsHardRefresh(ctx context.Context, cfg *watcherConfig, ap
 	return nil
 }
 
-func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterInstance) error {
+func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterInstance, appsByDestination map[string][]application) error {
 	project := projectFromVCI(vci, cfg.projectNamespacePrefixes)
 	if project == "" {
 		log.Printf("skipping VCI %s/%s: unable to derive project from label %q or namespace prefixes %v", vci.Metadata.Namespace, vci.Metadata.Name, loftProjectLabel, cfg.projectNamespacePrefixes)
 		return nil
 	}
 
-	apps, err := cfg.api.listApplications(ctx, cfg.argocdApplicationNamespace, cfg.applicationProjectLabelKey, project, cfg.applicationNameLabelKey, vci.Metadata.Name)
-	if err != nil {
-		return fmt.Errorf("list applications for project=%s virtualcluster=%s: %w", project, vci.Metadata.Name, err)
-	}
-
 	secretName := clusterSecretName(cfg.clusterSecretNameTemplate, project, vci.Metadata.Name)
+	apps := appsByDestination[secretName]
 	clusterSecret, err := cfg.api.getSecret(ctx, cfg.argocdClusterSecretNamespace, secretName)
 	if err != nil {
 		var statusErr *apiStatusError
@@ -728,8 +739,14 @@ func reconcileAll(ctx context.Context, cfg *watcherConfig) error {
 		return err
 	}
 
+	apps, err := cfg.api.listApplications(ctx, cfg.argocdApplicationNamespace)
+	if err != nil {
+		return fmt.Errorf("list applications in namespace %s: %w", cfg.argocdApplicationNamespace, err)
+	}
+	appsByDestination := applicationsByDestinationName(apps)
+
 	for _, vci := range vcis {
-		if err := reconcileVCI(ctx, cfg, vci); err != nil {
+		if err := reconcileVCI(ctx, cfg, vci, appsByDestination); err != nil {
 			log.Printf("reconcile failed for VCI %s/%s: %v", vci.Metadata.Namespace, vci.Metadata.Name, err)
 		}
 	}

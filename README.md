@@ -148,7 +148,7 @@ The proxy and the watcher solve different parts of the sleeping-vCluster flow:
 The watcher polls `VirtualClusterInstance` objects from the management cluster API and then:
 
 - derives the project from `metadata.labels["loft.sh/project"]` when present, otherwise from `metadata.namespace` using `WATCH_PROJECT_NAMESPACE_PREFIXES`
-- finds matching Argo CD `Application` objects by label using `WATCH_APPLICATION_PROJECT_LABEL` and `WATCH_APPLICATION_NAME_LABEL`
+- finds matching Argo CD `Application` objects by `spec.destination.name`, which should align with the imported cluster Secret name such as `loft-<project>-vcluster-<virtualcluster>`
 - classifies the vCluster as `Sleeping`, `Waking`, `Ready`, or `Unknown`
 - patches the imported cluster Secret with `argocd.argoproj.io/skip-reconcile: "true"` while the vCluster is sleeping or waking
 - removes `skip-reconcile` and annotates matching apps with `argocd.argoproj.io/refresh: hard` once the vCluster is ready again
@@ -168,8 +168,6 @@ Important watcher settings:
 | `ARGOCD_CLUSTER_SECRET_NAMESPACE` | `ARGOCD_NAMESPACE` | Namespace where imported cluster Secrets live |
 | `WATCH_POLL_INTERVAL` | `15s` | How often to poll `VirtualClusterInstance` objects |
 | `WATCH_PROJECT_NAMESPACE_PREFIXES` | `p-,loft-p-` | Namespace prefixes used when no `loft.sh/project` label is present |
-| `WATCH_APPLICATION_PROJECT_LABEL` | `vclusterProjectId` | Application label key for the project join |
-| `WATCH_APPLICATION_NAME_LABEL` | `vclusterName` | Application label key for the vCluster name join |
 | `WATCH_PATCH_APPLICATION_HEALTH` | `false` | When `true`, patches `Application.status.health` to `Suspended` or `Progressing` while Argo is paused |
 | `WATCH_SLEEPING_MESSAGE` | `vCluster sleeping` | Health message written when app health patching is enabled |
 | `WATCH_WAKING_MESSAGE` | `vCluster waking` | Health message written when app health patching is enabled |
