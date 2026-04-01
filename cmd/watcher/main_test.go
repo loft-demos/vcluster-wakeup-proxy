@@ -375,6 +375,36 @@ func TestRestoreKargoApplicationsHealthSkipsActiveSyncIntent(t *testing.T) {
 	}
 }
 
+func TestRememberKargoApplicationsHealthSkipsTransientProgressingState(t *testing.T) {
+	runtime := newWatcherRuntime()
+	runtime.lastKnownKargoHealth["kargo-app"] = healthStatus{Status: "Healthy"}
+
+	apps := []application{
+		{
+			Metadata: metadata{
+				Name: "kargo-app",
+				Annotations: map[string]string{
+					kargoAuthorizedStageAnnotation: "demo:pre-prod",
+				},
+			},
+			Status: applicationStatus{
+				Health: healthStatus{
+					Status: "Progressing",
+				},
+			},
+		},
+	}
+
+	rememberKargoApplicationsHealth(runtime, apps, watcherConfig{
+		sleepingHealthMessage: "vCluster sleeping",
+		wakingHealthMessage:   "vCluster waking",
+	})
+
+	if got := runtime.lastKnownKargoHealth["kargo-app"].Status; got != "Healthy" {
+		t.Fatalf("expected cached healthy state to be preserved, got %q", got)
+	}
+}
+
 func TestLoadWatcherConfigEnablesApplicationHealthPatchingByDefault(t *testing.T) {
 	tokenPath := writeWatcherTestToken(t)
 

@@ -924,6 +924,10 @@ func rememberKargoApplicationsHealth(runtime *watcherRuntime, apps []application
 		if applicationHasManagedHealth(app, cfg) {
 			continue
 		}
+		switch strings.TrimSpace(app.Status.Health.Status) {
+		case "", "Progressing", "Unknown":
+			continue
+		}
 		runtime.lastKnownKargoHealth[app.Metadata.Name] = app.Status.Health
 	}
 }
