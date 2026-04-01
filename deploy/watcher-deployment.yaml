@@ -1,3 +1,16 @@
+# Optional Secret for direct watcher -> vCluster Platform wake requests.
+# Uncomment and replace the placeholder token if you want the watcher to call the
+# platform API directly via WATCH_WAKE_UPSTREAM_BASE instead of going through cmd/proxy.
+#
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: vcluster-platform-token
+#   namespace: argocd
+# type: Opaque
+# stringData:
+#   token: "<replace-with-platform-api-token>"
+# ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -35,6 +48,22 @@ spec:
               value: "p-,loft-p-"
             - name: WATCH_PATCH_APPLICATION_HEALTH
               value: "true"
+            # Optional: wake sleeping destinations when Argo sets Application.operation.sync.
+            # Point this either at the vCluster Platform API directly or at cmd/proxy if you
+            # want to reuse its tolerant 502/504 wake handling.
+            # - name: WATCH_WAKE_UPSTREAM_BASE
+            #   value: "https://platform.example.com"
+            # - name: WATCH_WAKE_TOKEN_PATH
+            #   value: "/var/run/secrets/platform/token"
+            # - name: WATCH_WAKE_TIMEOUT
+            #   value: "10s"
+            # - name: WATCH_WAKE_RETRY_INTERVAL
+            #   value: "30s"
+          # Uncomment when using WATCH_WAKE_TOKEN_PATH with the example Secret above.
+          # volumeMounts:
+          #   - name: platform-token
+          #     mountPath: /var/run/secrets/platform
+          #     readOnly: true
           resources:
             requests:
               cpu: 10m
@@ -42,3 +71,11 @@ spec:
             limits:
               cpu: 100m
               memory: 128Mi
+      # Uncomment when using WATCH_WAKE_TOKEN_PATH with the example Secret above.
+      # volumes:
+      #   - name: platform-token
+      #     secret:
+      #       secretName: vcluster-platform-token
+      #       items:
+      #         - key: token
+      #           path: token

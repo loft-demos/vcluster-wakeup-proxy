@@ -143,7 +143,7 @@ If you use `ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE`, grant `patch` on the s
 The proxy and the watcher solve different parts of the sleeping-vCluster flow:
 
 - `cmd/proxy` handles the wake-triggering HTTP request and can wait for readiness before returning an accepted response
-- `cmd/watcher` continuously reconciles Argo CD behavior from `VirtualClusterInstance` state
+- `cmd/watcher` continuously reconciles Argo CD behavior from `VirtualClusterInstance` state and can optionally trigger wake requests from `Application.operation.sync`
 
 The watcher polls `VirtualClusterInstance` objects from the management cluster API and then:
 
@@ -151,10 +151,13 @@ The watcher polls `VirtualClusterInstance` objects from the management cluster A
 - finds matching Argo CD `Application` objects by `spec.destination.name`, which should align with the imported cluster Secret name such as `loft-<project>-vcluster-<virtualcluster>`
 - classifies the vCluster as `Sleeping`, `Waking`, `Ready`, or `Unknown`
 - patches the imported cluster Secret with `argocd.argoproj.io/skip-reconcile: "true"` while the vCluster is sleeping or waking
+- optionally triggers `POST /kubernetes/project/<project>/virtualcluster/<name>` when a matching app has `Application.operation.sync`
 - removes `skip-reconcile` and annotates matching apps with `argocd.argoproj.io/refresh: hard` once the vCluster is ready again
-- optionally patches `Application.status.health` while sleeping or waking when `WATCH_PATCH_APPLICATION_HEALTH=true`
+- optionally patches non-Kargo `Application.status.health` while sleeping or waking unless `WATCH_PATCH_APPLICATION_HEALTH=false`
 
 Sleep detection prefers the platform-managed annotations `sleepmode.loft.sh/sleeping-since` and `sleepmode.loft.sh/sleep-type`, then falls back to `status.phase`, `status.reason`, `status.message`, and the `VirtualClusterOnline` condition.
+
+The cluster-secret pause path is meant for Argo CD `v3.4.0-rc1` or newer, where cluster-secret `argocd.argoproj.io/skip-reconcile: "true"` is honored by the application controller.
 
 Ready-to-apply example manifests are included in [deploy/watcher-rbac.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/watcher-rbac.yaml) and [deploy/watcher-deployment.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/watcher-deployment.yaml).
 
@@ -168,9 +171,16 @@ Important watcher settings:
 | `ARGOCD_CLUSTER_SECRET_NAMESPACE` | `ARGOCD_NAMESPACE` | Namespace where imported cluster Secrets live |
 | `WATCH_POLL_INTERVAL` | `15s` | How often to poll `VirtualClusterInstance` objects |
 | `WATCH_PROJECT_NAMESPACE_PREFIXES` | `p-,loft-p-` | Namespace prefixes used when no `loft.sh/project` label is present |
-| `WATCH_PATCH_APPLICATION_HEALTH` | `false` | When `true`, patches `Application.status.health` to `Suspended` or `Progressing` while Argo is paused |
+| `WATCH_PATCH_APPLICATION_HEALTH` | `true` | When not set to `false`, patches non-Kargo `Application.status.health` to `Suspended` or `Progressing` while Argo is paused |
 | `WATCH_SLEEPING_MESSAGE` | `vCluster sleeping` | Health message written when app health patching is enabled |
 | `WATCH_WAKING_MESSAGE` | `vCluster waking` | Health message written when app health patching is enabled |
+| `WATCH_WAKE_UPSTREAM_BASE` | disabled | Optional base URL used to trigger `POST /kubernetes/project/<project>/virtualcluster/<name>` when a sleeping destination has `Application.operation.sync` |
+| `WATCH_WAKE_TIMEOUT` | `10s` | Timeout for the wake request HTTP client |
+| `WATCH_WAKE_SUCCESS_ON` | `502,504` | Comma-separated additional wake response codes treated as accepted, beyond `200` and `202` |
+| `WATCH_WAKE_BEARER_TOKEN` | none | Optional bearer token sent with the wake request |
+| `WATCH_WAKE_TOKEN_PATH` | none | Optional path to a file containing the bearer token for the wake request |
+| `WATCH_WAKE_CA_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | CA bundle used when `WATCH_WAKE_UPSTREAM_BASE` is `https://...` |
+| `WATCH_WAKE_RETRY_INTERVAL` | `30s` | Minimum delay before retrying a wake request while the same sync intent is still present and the vCluster remains asleep |
 | `WATCH_KUBERNETES_API` | auto | Optional Kubernetes API base URL. Defaults to the in-cluster API |
 | `WATCH_KUBERNETES_TIMEOUT` | `10s` | Timeout for watcher Kubernetes API requests |
 | `WATCH_TOKEN_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Bearer token for watcher API calls |
@@ -178,6 +188,12 @@ Important watcher settings:
 
 The example watcher Deployment uses `WATCH_POLL_INTERVAL=2s` so it can react quickly when a vCluster transitions into sleep.
 
-The example watcher Deployment enables `WATCH_PATCH_APPLICATION_HEALTH=true` so it can correct the visible Argo CD app health after the vCluster is paused. If your cluster does not expose the `applications/status` subresource, the watcher falls back to patching the `Application` resource itself. If that still is not allowed in your cluster, it automatically disables health patching and continues managing cluster-secret pause/unpause plus app refresh.
+Application health patching is enabled by default so non-Kargo apps show a helpful `Suspended` or `Progressing` status in Argo CD while their destination vCluster is asleep or waking. Apps annotated with `kargo.akuity.io/authorized-stage` are automatically excluded so the watcher does not force Kargo-managed apps into an artificial health state. Set `WATCH_PATCH_APPLICATION_HEALTH=false` to disable health patching entirely.
+
+If your cluster does not expose the `applications/status` subresource, the watcher falls back to patching the `Application` resource itself. If that still is not allowed in your cluster, it automatically disables health patching and continues managing cluster-secret pause/unpause plus app refresh.
+
+When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats `Application.operation.sync` as wake intent for sleeping destinations. This is the deterministic path for explicit syncs, including Kargo templates that end with `argocd-update`. Repo webhooks and Argo CD auto-sync may also result in `.operation.sync`, but that is controller-driven and should be treated as best-effort, not the primary contract.
+
+If you already run `cmd/proxy`, you can point `WATCH_WAKE_UPSTREAM_BASE` at the proxy service so the watcher reuses the proxy's tolerant wake semantics for transient `502` / `504` responses. If you do not need that behavior, point the watcher directly at the vCluster Platform API instead.
 
 Build the watcher image with [Dockerfile.watcher](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/Dockerfile.watcher).

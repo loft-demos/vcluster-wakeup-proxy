@@ -24,6 +24,7 @@ import (
 const (
 	argocdClusterRefreshAnnotation = "argocd.argoproj.io/refresh"
 	argocdSkipReconcileAnnotation  = "argocd.argoproj.io/skip-reconcile"
+	kargoAuthorizedStageAnnotation = "kargo.akuity.io/authorized-stage"
 
 	loftProjectLabel                  = "loft.sh/project"
 	sleepingSinceAnnotation           = "sleepmode.loft.sh/sleeping-since"
@@ -34,6 +35,7 @@ const (
 
 	defaultKubernetesServiceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	defaultKubernetesServiceAccountCAPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	defaultWakeRetryInterval                 = 30 * time.Second
 )
 
 type vciState string
@@ -47,7 +49,9 @@ const (
 
 type watcherConfig struct {
 	api                          *kubernetesAPI
+	wakeRequester                *wakeRequester
 	pollInterval                 time.Duration
+	wakeRetryInterval            time.Duration
 	argocdApplicationNamespace   string
 	argocdClusterSecretNamespace string
 	clusterSecretNameTemplate    string
@@ -67,6 +71,18 @@ type kubernetesAPI struct {
 	client      *http.Client
 	apiBase     string
 	bearerToken string
+}
+
+type wakeRequester struct {
+	client           *http.Client
+	baseURL          string
+	bearerToken      string
+	acceptedStatuses map[int]struct{}
+}
+
+type watcherRuntime struct {
+	observedSyncIntents map[string]string
+	lastWakeAttempt     map[string]time.Time
 }
 
 type metadata struct {
@@ -105,6 +121,10 @@ type applicationStatus struct {
 	Health healthStatus `json:"health"`
 }
 
+type applicationOperation struct {
+	Sync json.RawMessage `json:"sync"`
+}
+
 type applicationDestination struct {
 	Name string `json:"name"`
 }
@@ -114,9 +134,10 @@ type applicationSpec struct {
 }
 
 type application struct {
-	Metadata metadata          `json:"metadata"`
-	Spec     applicationSpec   `json:"spec"`
-	Status   applicationStatus `json:"status"`
+	Metadata  metadata              `json:"metadata"`
+	Spec      applicationSpec       `json:"spec"`
+	Status    applicationStatus     `json:"status"`
+	Operation *applicationOperation `json:"operation,omitempty"`
 }
 
 type secret struct {
@@ -166,6 +187,28 @@ func parseList(v string) []string {
 	return items
 }
 
+func parseStatusSet(v string) map[int]struct{} {
+	set := map[int]struct{}{}
+	if v == "" {
+		return set
+	}
+
+	for _, s := range strings.Split(v, ",") {
+		switch strings.TrimSpace(s) {
+		case "429":
+			set[http.StatusTooManyRequests] = struct{}{}
+		case "500":
+			set[http.StatusInternalServerError] = struct{}{}
+		case "502":
+			set[http.StatusBadGateway] = struct{}{}
+		case "504":
+			set[http.StatusGatewayTimeout] = struct{}{}
+		}
+	}
+
+	return set
+}
+
 func inClusterKubernetesAPIBase() (string, error) {
 	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
 	if host == "" {
@@ -212,6 +255,49 @@ func newClusterHTTPClient(apiBase, caPath string, timeout time.Duration) (*http.
 	}
 
 	return &http.Client{Transport: transport, Timeout: timeout}, nil
+}
+
+func newWakeRequesterFromEnv() (*wakeRequester, error) {
+	baseURL := strings.TrimSpace(os.Getenv("WATCH_WAKE_UPSTREAM_BASE"))
+	if baseURL == "" {
+		return nil, nil
+	}
+
+	timeout := 10 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("WATCH_WAKE_TIMEOUT")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse WATCH_WAKE_TIMEOUT: %w", err)
+		}
+		timeout = parsed
+	}
+
+	caPath := mustEnv("WATCH_WAKE_CA_PATH", defaultKubernetesServiceAccountCAPath)
+	client, err := newClusterHTTPClient(baseURL, caPath, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	bearerToken := strings.TrimSpace(os.Getenv("WATCH_WAKE_BEARER_TOKEN"))
+	if bearerToken == "" {
+		if tokenPath := strings.TrimSpace(os.Getenv("WATCH_WAKE_TOKEN_PATH")); tokenPath != "" {
+			tokenBytes, err := os.ReadFile(tokenPath)
+			if err != nil {
+				return nil, fmt.Errorf("read wake token %q: %w", tokenPath, err)
+			}
+			bearerToken = strings.TrimSpace(string(tokenBytes))
+			if bearerToken == "" {
+				return nil, fmt.Errorf("wake token %q is empty", tokenPath)
+			}
+		}
+	}
+
+	return &wakeRequester{
+		client:           client,
+		baseURL:          baseURL,
+		bearerToken:      bearerToken,
+		acceptedStatuses: parseStatusSet(mustEnv("WATCH_WAKE_SUCCESS_ON", "502,504")),
+	}, nil
 }
 
 func loadWatcherConfig() (watcherConfig, error) {
@@ -275,22 +361,85 @@ func loadWatcherConfig() (watcherConfig, error) {
 		return watcherConfig{}, errors.New("WATCH_PROJECT_NAMESPACE_PREFIXES must contain at least one prefix")
 	}
 
+	wakeRequester, err := newWakeRequesterFromEnv()
+	if err != nil {
+		return watcherConfig{}, err
+	}
+
+	wakeRetryInterval := defaultWakeRetryInterval
+	if raw := strings.TrimSpace(os.Getenv("WATCH_WAKE_RETRY_INTERVAL")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return watcherConfig{}, fmt.Errorf("parse WATCH_WAKE_RETRY_INTERVAL: %w", err)
+		}
+		if parsed <= 0 {
+			return watcherConfig{}, errors.New("WATCH_WAKE_RETRY_INTERVAL must be greater than zero")
+		}
+		wakeRetryInterval = parsed
+	}
+
 	return watcherConfig{
 		api: &kubernetesAPI{
 			client:      client,
 			apiBase:     apiBase,
 			bearerToken: token,
 		},
+		wakeRequester:                wakeRequester,
 		pollInterval:                 pollInterval,
+		wakeRetryInterval:            wakeRetryInterval,
 		argocdApplicationNamespace:   appNamespace,
 		argocdClusterSecretNamespace: secretNamespace,
 		clusterSecretNameTemplate:    clusterSecretNameTemplate,
 		projectNamespacePrefixes:     projectNamespacePrefixes,
-		patchApplicationHealth:       strings.EqualFold(mustEnv("WATCH_PATCH_APPLICATION_HEALTH", "false"), "true"),
+		patchApplicationHealth:       !strings.EqualFold(mustEnv("WATCH_PATCH_APPLICATION_HEALTH", "true"), "false"),
 		applicationHealthPatchMode:   applicationHealthPatchModeStatus,
 		sleepingHealthMessage:        mustEnv("WATCH_SLEEPING_MESSAGE", "vCluster sleeping"),
 		wakingHealthMessage:          mustEnv("WATCH_WAKING_MESSAGE", "vCluster waking"),
 	}, nil
+}
+
+func (w *wakeRequester) Execute(ctx context.Context, project, virtualCluster string) error {
+	if w == nil {
+		return nil
+	}
+
+	targetURL := strings.TrimRight(w.baseURL, "/") +
+		"/kubernetes/project/" + url.PathEscape(project) +
+		"/virtualcluster/" + url.PathEscape(virtualCluster)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, nil)
+	if err != nil {
+		return fmt.Errorf("build wake request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if w.bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+w.bearerToken)
+	}
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("post wake request %s: %w", targetURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	if _, ok := w.acceptedStatuses[resp.StatusCode]; ok {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return fmt.Errorf("post wake request %s: %s: %s", targetURL, resp.Status, strings.TrimSpace(string(body)))
+}
+
+func newWatcherRuntime() *watcherRuntime {
+	return &watcherRuntime{
+		observedSyncIntents: map[string]string{},
+		lastWakeAttempt:     map[string]time.Time{},
+	}
 }
 
 func (a *kubernetesAPI) request(ctx context.Context, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
@@ -572,6 +721,108 @@ func applicationHasManagedHealth(app application, cfg watcherConfig) bool {
 	}
 }
 
+func applicationIsKargoManaged(app application) bool {
+	if app.Metadata.Annotations == nil {
+		return false
+	}
+	return strings.TrimSpace(app.Metadata.Annotations[kargoAuthorizedStageAnnotation]) != ""
+}
+
+func applicationSyncIntentFingerprint(app application) string {
+	if app.Operation == nil {
+		return ""
+	}
+
+	syncPayload := bytes.TrimSpace(app.Operation.Sync)
+	if len(syncPayload) == 0 || bytes.Equal(syncPayload, []byte("null")) {
+		return ""
+	}
+
+	return string(syncPayload)
+}
+
+func applicationsWithSyncIntent(apps []application) []application {
+	var filtered []application
+	for _, app := range apps {
+		if applicationSyncIntentFingerprint(app) == "" {
+			continue
+		}
+		filtered = append(filtered, app)
+	}
+	return filtered
+}
+
+func newSyncIntentApplications(apps []application, observed map[string]string) []application {
+	var filtered []application
+	for _, app := range apps {
+		fingerprint := applicationSyncIntentFingerprint(app)
+		if fingerprint == "" || observed[app.Metadata.Name] == fingerprint {
+			continue
+		}
+		filtered = append(filtered, app)
+	}
+	return filtered
+}
+
+func rememberSyncIntentApplications(runtime *watcherRuntime, apps []application) {
+	if runtime == nil {
+		return
+	}
+
+	for _, app := range apps {
+		if fingerprint := applicationSyncIntentFingerprint(app); fingerprint != "" {
+			runtime.observedSyncIntents[app.Metadata.Name] = fingerprint
+			continue
+		}
+		delete(runtime.observedSyncIntents, app.Metadata.Name)
+	}
+}
+
+func forgetCompletedSyncIntentApplications(runtime *watcherRuntime, apps []application) {
+	if runtime == nil {
+		return
+	}
+
+	active := make(map[string]struct{}, len(apps))
+	for _, app := range apps {
+		if applicationSyncIntentFingerprint(app) == "" {
+			continue
+		}
+		active[app.Metadata.Name] = struct{}{}
+	}
+
+	for name := range runtime.observedSyncIntents {
+		if _, ok := active[name]; ok {
+			continue
+		}
+		delete(runtime.observedSyncIntents, name)
+	}
+}
+
+func applicationNames(apps []application) []string {
+	names := make([]string, 0, len(apps))
+	for _, app := range apps {
+		if name := strings.TrimSpace(app.Metadata.Name); name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func wakeRetryDue(runtime *watcherRuntime, clusterSecretName string, retryInterval time.Duration, now time.Time) bool {
+	if runtime == nil {
+		return true
+	}
+
+	lastAttempt, ok := runtime.lastWakeAttempt[clusterSecretName]
+	if !ok || lastAttempt.IsZero() {
+		return true
+	}
+
+	return now.Sub(lastAttempt) >= retryInterval
+}
+
 func applicationsNeedReadyRefresh(apps []application, cfg watcherConfig) bool {
 	if !cfg.patchApplicationHealth {
 		return false
@@ -604,6 +855,10 @@ func patchApplicationHealth(ctx context.Context, cfg *watcherConfig, name, statu
 
 func patchApplicationsHealth(ctx context.Context, cfg *watcherConfig, apps []application, status, message string) error {
 	for _, app := range apps {
+		if applicationIsKargoManaged(app) {
+			continue
+		}
+
 		if app.Status.Health.Status == status && app.Status.Health.Message == message {
 			continue
 		}
@@ -664,7 +919,11 @@ func annotateApplicationsHardRefresh(ctx context.Context, cfg *watcherConfig, ap
 	return nil
 }
 
-func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterInstance, appsByDestination map[string][]application) error {
+func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime, vci virtualClusterInstance, appsByDestination map[string][]application) error {
+	if runtime == nil {
+		runtime = newWatcherRuntime()
+	}
+
 	project := projectFromVCI(vci, cfg.projectNamespacePrefixes)
 	if project == "" {
 		log.Printf("skipping VCI %s/%s: unable to derive project from label %q or namespace prefixes %v", vci.Metadata.Namespace, vci.Metadata.Name, loftProjectLabel, cfg.projectNamespacePrefixes)
@@ -685,6 +944,8 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterIns
 
 	secretPaused := clusterSecret != nil && strings.TrimSpace(clusterSecret.Metadata.Annotations[argocdSkipReconcileAnnotation]) == "true"
 	state := classifyVCI(vci, secretPaused)
+	syncIntentApps := applicationsWithSyncIntent(apps)
+	newSyncIntentApps := newSyncIntentApplications(syncIntentApps, runtime.observedSyncIntents)
 
 	switch state {
 	case vciStateSleeping:
@@ -694,12 +955,41 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterIns
 			}
 			log.Printf("marked cluster secret %s/%s with %s=true for sleeping VCI %s/%s", cfg.argocdClusterSecretNamespace, secretName, argocdSkipReconcileAnnotation, vci.Metadata.Namespace, vci.Metadata.Name)
 		}
+		if cfg.wakeRequester != nil && len(syncIntentApps) > 0 {
+			shouldWake := len(newSyncIntentApps) > 0 || wakeRetryDue(runtime, secretName, cfg.wakeRetryInterval, time.Now())
+			if shouldWake {
+				triggerApps := newSyncIntentApps
+				if len(triggerApps) == 0 {
+					triggerApps = syncIntentApps
+				}
+
+				if err := cfg.wakeRequester.Execute(ctx, project, vci.Metadata.Name); err != nil {
+					return fmt.Errorf(
+						"wake sleeping VCI %s/%s from sync intent on applications %s: %w",
+						vci.Metadata.Namespace,
+						vci.Metadata.Name,
+						strings.Join(applicationNames(triggerApps), ", "),
+						err,
+					)
+				}
+
+				runtime.lastWakeAttempt[secretName] = time.Now()
+				rememberSyncIntentApplications(runtime, syncIntentApps)
+				log.Printf(
+					"triggered wake for sleeping VCI %s/%s due to sync intent on applications %s",
+					vci.Metadata.Namespace,
+					vci.Metadata.Name,
+					strings.Join(applicationNames(triggerApps), ", "),
+				)
+			}
+		}
 		if cfg.patchApplicationHealth {
 			if err := patchApplicationsHealth(ctx, cfg, apps, "Suspended", cfg.sleepingHealthMessage); err != nil {
 				return err
 			}
 		}
 	case vciStateWaking:
+		rememberSyncIntentApplications(runtime, syncIntentApps)
 		if clusterSecret != nil && !secretPaused {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, true); err != nil {
 				return fmt.Errorf("pause cluster secret %s/%s during wake: %w", cfg.argocdClusterSecretNamespace, secretName, err)
@@ -713,6 +1003,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterIns
 		}
 	case vciStateReady:
 		readyTransition := secretPaused || applicationsNeedReadyRefresh(apps, *cfg)
+		rememberSyncIntentApplications(runtime, syncIntentApps)
 
 		if clusterSecret != nil && secretPaused {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, false); err != nil {
@@ -726,6 +1017,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterIns
 				return err
 			}
 		}
+		delete(runtime.lastWakeAttempt, secretName)
 	case vciStateUnknown:
 		log.Printf("leaving VCI %s/%s unchanged: state classification is unknown", vci.Metadata.Namespace, vci.Metadata.Name)
 	}
@@ -733,7 +1025,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, vci virtualClusterIns
 	return nil
 }
 
-func reconcileAll(ctx context.Context, cfg *watcherConfig) error {
+func reconcileAll(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime) error {
 	vcis, err := cfg.api.listVirtualClusterInstances(ctx)
 	if err != nil {
 		return err
@@ -743,10 +1035,11 @@ func reconcileAll(ctx context.Context, cfg *watcherConfig) error {
 	if err != nil {
 		return fmt.Errorf("list applications in namespace %s: %w", cfg.argocdApplicationNamespace, err)
 	}
+	forgetCompletedSyncIntentApplications(runtime, apps)
 	appsByDestination := applicationsByDestinationName(apps)
 
 	for _, vci := range vcis {
-		if err := reconcileVCI(ctx, cfg, vci, appsByDestination); err != nil {
+		if err := reconcileVCI(ctx, cfg, runtime, vci, appsByDestination); err != nil {
 			log.Printf("reconcile failed for VCI %s/%s: %v", vci.Metadata.Namespace, vci.Metadata.Name, err)
 		}
 	}
@@ -755,7 +1048,9 @@ func reconcileAll(ctx context.Context, cfg *watcherConfig) error {
 }
 
 func run(ctx context.Context, cfg *watcherConfig) error {
-	if err := reconcileAll(ctx, cfg); err != nil {
+	runtime := newWatcherRuntime()
+
+	if err := reconcileAll(ctx, cfg, runtime); err != nil {
 		log.Printf("initial reconcile failed: %v", err)
 	}
 
@@ -767,7 +1062,7 @@ func run(ctx context.Context, cfg *watcherConfig) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := reconcileAll(ctx, cfg); err != nil {
+			if err := reconcileAll(ctx, cfg, runtime); err != nil {
 				log.Printf("reconcile loop failed: %v", err)
 			}
 		}
@@ -784,12 +1079,13 @@ func main() {
 	defer stop()
 
 	log.Printf(
-		"watcher polling every %s for VirtualClusterInstances -> apps namespace %s, cluster secrets namespace %s, template %q, patch application health=%v",
+		"watcher polling every %s for VirtualClusterInstances -> apps namespace %s, cluster secrets namespace %s, template %q, patch application health=%v, wake on sync=%v",
 		cfg.pollInterval,
 		cfg.argocdApplicationNamespace,
 		cfg.argocdClusterSecretNamespace,
 		cfg.clusterSecretNameTemplate,
 		cfg.patchApplicationHealth,
+		cfg.wakeRequester != nil,
 	)
 
 	if err := run(ctx, &cfg); err != nil && !errors.Is(err, context.Canceled) {
