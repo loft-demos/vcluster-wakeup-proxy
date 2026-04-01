@@ -81,9 +81,12 @@ type wakeRequester struct {
 }
 
 type watcherRuntime struct {
-	observedSyncIntents  map[string]string
-	lastWakeAttempt      map[string]time.Time
-	lastKnownKargoHealth map[string]healthStatus
+	observedSyncIntents      map[string]string
+	observedKargoPromotions  map[string]string
+	lastWakeAttempt          map[string]time.Time
+	lastKnownKargoHealth     map[string]healthStatus
+	kargoPromotionsChecked   bool
+	kargoPromotionsAvailable bool
 }
 
 type metadata struct {
@@ -139,6 +142,31 @@ type application struct {
 	Spec      applicationSpec       `json:"spec"`
 	Status    applicationStatus     `json:"status"`
 	Operation *applicationOperation `json:"operation,omitempty"`
+}
+
+type promotionStep struct {
+	Uses string `json:"uses"`
+}
+
+type promotionSpec struct {
+	Stage string          `json:"stage"`
+	Steps []promotionStep `json:"steps"`
+}
+
+type promotionStatus struct {
+	Phase string `json:"phase"`
+}
+
+type promotion struct {
+	Metadata metadata        `json:"metadata"`
+	Spec     promotionSpec   `json:"spec"`
+	Status   promotionStatus `json:"status"`
+}
+
+type kargoWakeTrigger struct {
+	Apps           []application
+	PromotionNames []string
+	Fingerprint    string
 }
 
 type secret struct {
@@ -438,10 +466,41 @@ func (w *wakeRequester) Execute(ctx context.Context, project, virtualCluster str
 
 func newWatcherRuntime() *watcherRuntime {
 	return &watcherRuntime{
-		observedSyncIntents:  map[string]string{},
-		lastWakeAttempt:      map[string]time.Time{},
-		lastKnownKargoHealth: map[string]healthStatus{},
+		observedSyncIntents:     map[string]string{},
+		observedKargoPromotions: map[string]string{},
+		lastWakeAttempt:         map[string]time.Time{},
+		lastKnownKargoHealth:    map[string]healthStatus{},
 	}
+}
+
+func listPromotionsOptional(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime) ([]promotion, error) {
+	if runtime != nil && runtime.kargoPromotionsChecked && !runtime.kargoPromotionsAvailable {
+		return nil, nil
+	}
+
+	promotions, err := cfg.api.listPromotions(ctx)
+	if err != nil {
+		var statusErr *apiStatusError
+		if errors.As(err, &statusErr) {
+			switch statusErr.StatusCode {
+			case http.StatusNotFound, http.StatusForbidden, http.StatusMethodNotAllowed:
+				if runtime != nil {
+					runtime.kargoPromotionsChecked = true
+					runtime.kargoPromotionsAvailable = false
+				}
+				log.Printf("Kargo Promotion discovery unavailable (%s); continuing with Argo-only wake detection", statusErr.Status)
+				return nil, nil
+			}
+		}
+		return nil, err
+	}
+
+	if runtime != nil {
+		runtime.kargoPromotionsChecked = true
+		runtime.kargoPromotionsAvailable = true
+	}
+
+	return promotions, nil
 }
 
 func (a *kubernetesAPI) request(ctx context.Context, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
@@ -535,6 +594,20 @@ func (a *kubernetesAPI) listApplications(ctx context.Context, namespace string) 
 	return out.Items, nil
 }
 
+func (a *kubernetesAPI) listPromotions(ctx context.Context) ([]promotion, error) {
+	var out listResponse[promotion]
+	if err := a.getJSON(ctx, "/apis/kargo.akuity.io/v1alpha1/promotions", nil, &out); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(out.Items, func(i, j int) bool {
+		left := out.Items[i].Metadata.Namespace + "/" + out.Items[i].Metadata.Name
+		right := out.Items[j].Metadata.Namespace + "/" + out.Items[j].Metadata.Name
+		return left < right
+	})
+	return out.Items, nil
+}
+
 func applicationsByDestinationName(apps []application) map[string][]application {
 	indexed := make(map[string][]application)
 	for _, app := range apps {
@@ -545,6 +618,143 @@ func applicationsByDestinationName(apps []application) map[string][]application 
 		indexed[destinationName] = append(indexed[destinationName], app)
 	}
 	return indexed
+}
+
+func applicationAuthorizedStageKey(app application) string {
+	if app.Metadata.Annotations == nil {
+		return ""
+	}
+
+	raw := strings.TrimSpace(app.Metadata.Annotations[kargoAuthorizedStageAnnotation])
+	if raw == "" {
+		return ""
+	}
+
+	parts := strings.SplitN(raw, ":", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+
+	namespace := strings.TrimSpace(parts[0])
+	stage := strings.TrimSpace(parts[1])
+	if namespace == "" || stage == "" {
+		return ""
+	}
+
+	return namespace + "/" + stage
+}
+
+func applicationsByAuthorizedStage(apps []application) map[string][]application {
+	indexed := make(map[string][]application)
+	for _, app := range apps {
+		stageKey := applicationAuthorizedStageKey(app)
+		if stageKey == "" {
+			continue
+		}
+		indexed[stageKey] = append(indexed[stageKey], app)
+	}
+	return indexed
+}
+
+func promotionStageKey(promotion promotion) string {
+	namespace := strings.TrimSpace(promotion.Metadata.Namespace)
+	stage := strings.TrimSpace(promotion.Spec.Stage)
+	if namespace == "" || stage == "" {
+		return ""
+	}
+	return namespace + "/" + stage
+}
+
+func promotionUsesArgoCDUpdate(promotion promotion) bool {
+	for _, step := range promotion.Spec.Steps {
+		if strings.TrimSpace(step.Uses) == "argocd-update" {
+			return true
+		}
+	}
+	return false
+}
+
+func promotionIsActive(promotion promotion) bool {
+	switch strings.TrimSpace(promotion.Status.Phase) {
+	case "Succeeded", "Errored", "Failed", "Aborted", "Canceled", "Cancelled", "Skipped":
+		return false
+	default:
+		return true
+	}
+}
+
+func kargoWakeTriggersByDestination(apps []application, promotions []promotion) map[string]kargoWakeTrigger {
+	stageApps := applicationsByAuthorizedStage(apps)
+	type triggerAccumulator struct {
+		apps       map[string]application
+		promotions map[string]struct{}
+	}
+
+	accumulators := map[string]*triggerAccumulator{}
+	for _, promotion := range promotions {
+		if !promotionIsActive(promotion) || !promotionUsesArgoCDUpdate(promotion) {
+			continue
+		}
+
+		stageKey := promotionStageKey(promotion)
+		if stageKey == "" {
+			continue
+		}
+
+		matchingApps := stageApps[stageKey]
+		if len(matchingApps) == 0 {
+			continue
+		}
+
+		promotionName := strings.TrimSpace(promotion.Metadata.Name)
+		if promotionName == "" {
+			continue
+		}
+
+		for _, app := range matchingApps {
+			destinationName := strings.TrimSpace(app.Spec.Destination.Name)
+			if destinationName == "" {
+				continue
+			}
+
+			accumulator := accumulators[destinationName]
+			if accumulator == nil {
+				accumulator = &triggerAccumulator{
+					apps:       map[string]application{},
+					promotions: map[string]struct{}{},
+				}
+				accumulators[destinationName] = accumulator
+			}
+
+			accumulator.apps[app.Metadata.Name] = app
+			accumulator.promotions[promotionName] = struct{}{}
+		}
+	}
+
+	triggers := make(map[string]kargoWakeTrigger, len(accumulators))
+	for destinationName, accumulator := range accumulators {
+		appsForDestination := make([]application, 0, len(accumulator.apps))
+		for _, app := range accumulator.apps {
+			appsForDestination = append(appsForDestination, app)
+		}
+		sort.Slice(appsForDestination, func(i, j int) bool {
+			return appsForDestination[i].Metadata.Name < appsForDestination[j].Metadata.Name
+		})
+
+		promotionNames := make([]string, 0, len(accumulator.promotions))
+		for promotionName := range accumulator.promotions {
+			promotionNames = append(promotionNames, promotionName)
+		}
+		sort.Strings(promotionNames)
+
+		triggers[destinationName] = kargoWakeTrigger{
+			Apps:           appsForDestination,
+			PromotionNames: promotionNames,
+			Fingerprint:    strings.Join(promotionNames, "|"),
+		}
+	}
+
+	return triggers
 }
 
 func (a *kubernetesAPI) getApplication(ctx context.Context, namespace, name string) (*application, error) {
@@ -988,7 +1198,7 @@ func annotateApplicationsHardRefresh(ctx context.Context, cfg *watcherConfig, ap
 	return nil
 }
 
-func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime, vci virtualClusterInstance, appsByDestination map[string][]application) error {
+func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime, vci virtualClusterInstance, appsByDestination map[string][]application, kargoWakeTriggers map[string]kargoWakeTrigger) error {
 	if runtime == nil {
 		runtime = newWatcherRuntime()
 	}
@@ -1001,6 +1211,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 
 	secretName := clusterSecretName(cfg.clusterSecretNameTemplate, project, vci.Metadata.Name)
 	apps := appsByDestination[secretName]
+	kargoWakeTrigger := kargoWakeTriggers[secretName]
 	clusterSecret, err := cfg.api.getSecret(ctx, cfg.argocdClusterSecretNamespace, secretName)
 	if err != nil {
 		var statusErr *apiStatusError
@@ -1015,6 +1226,9 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	state := classifyVCI(vci, secretPaused)
 	syncIntentApps := applicationsWithSyncIntent(apps)
 	newSyncIntentApps := newSyncIntentApplications(syncIntentApps, runtime.observedSyncIntents)
+	if kargoWakeTrigger.Fingerprint == "" {
+		delete(runtime.observedKargoPromotions, secretName)
+	}
 
 	switch state {
 	case vciStateSleeping:
@@ -1025,31 +1239,53 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			}
 			log.Printf("marked cluster secret %s/%s with %s=true for sleeping VCI %s/%s", cfg.argocdClusterSecretNamespace, secretName, argocdSkipReconcileAnnotation, vci.Metadata.Namespace, vci.Metadata.Name)
 		}
-		if cfg.wakeRequester != nil && len(syncIntentApps) > 0 {
-			shouldWake := len(newSyncIntentApps) > 0 || wakeRetryDue(runtime, secretName, cfg.wakeRetryInterval, time.Now())
-			if shouldWake {
-				triggerApps := newSyncIntentApps
-				if len(triggerApps) == 0 {
-					triggerApps = syncIntentApps
-				}
+		if cfg.wakeRequester != nil {
+			now := time.Now()
+			shouldWake := false
+			triggerApps := []application(nil)
+			triggerReason := ""
 
+			if kargoWakeTrigger.Fingerprint != "" {
+				if runtime.observedKargoPromotions[secretName] != kargoWakeTrigger.Fingerprint ||
+					wakeRetryDue(runtime, secretName, cfg.wakeRetryInterval, now) {
+					shouldWake = true
+					triggerApps = kargoWakeTrigger.Apps
+					triggerReason = "active Kargo Promotions " + strings.Join(kargoWakeTrigger.PromotionNames, ", ")
+				}
+			}
+
+			if !shouldWake && len(syncIntentApps) > 0 {
+				if len(newSyncIntentApps) > 0 || wakeRetryDue(runtime, secretName, cfg.wakeRetryInterval, now) {
+					shouldWake = true
+					triggerApps = newSyncIntentApps
+					if len(triggerApps) == 0 {
+						triggerApps = syncIntentApps
+					}
+					triggerReason = "sync intent on applications " + strings.Join(applicationNames(triggerApps), ", ")
+				}
+			}
+
+			if shouldWake {
 				if err := cfg.wakeRequester.Execute(ctx, project, vci.Metadata.Name); err != nil {
 					return fmt.Errorf(
-						"wake sleeping VCI %s/%s from sync intent on applications %s: %w",
+						"wake sleeping VCI %s/%s from %s: %w",
 						vci.Metadata.Namespace,
 						vci.Metadata.Name,
-						strings.Join(applicationNames(triggerApps), ", "),
+						triggerReason,
 						err,
 					)
 				}
 
-				runtime.lastWakeAttempt[secretName] = time.Now()
+				runtime.lastWakeAttempt[secretName] = now
 				rememberSyncIntentApplications(runtime, syncIntentApps)
+				if kargoWakeTrigger.Fingerprint != "" {
+					runtime.observedKargoPromotions[secretName] = kargoWakeTrigger.Fingerprint
+				}
 				log.Printf(
-					"triggered wake for sleeping VCI %s/%s due to sync intent on applications %s",
+					"triggered wake for sleeping VCI %s/%s due to %s",
 					vci.Metadata.Namespace,
 					vci.Metadata.Name,
-					strings.Join(applicationNames(triggerApps), ", "),
+					triggerReason,
 				)
 			}
 		}
@@ -1120,9 +1356,14 @@ func reconcileAll(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	}
 	forgetCompletedSyncIntentApplications(runtime, apps)
 	appsByDestination := applicationsByDestinationName(apps)
+	promotions, err := listPromotionsOptional(ctx, cfg, runtime)
+	if err != nil {
+		log.Printf("list Kargo Promotions failed; continuing with Argo-only wake detection: %v", err)
+	}
+	kargoWakeTriggers := kargoWakeTriggersByDestination(apps, promotions)
 
 	for _, vci := range vcis {
-		if err := reconcileVCI(ctx, cfg, runtime, vci, appsByDestination); err != nil {
+		if err := reconcileVCI(ctx, cfg, runtime, vci, appsByDestination, kargoWakeTriggers); err != nil {
 			log.Printf("reconcile failed for VCI %s/%s: %v", vci.Metadata.Namespace, vci.Metadata.Name, err)
 		}
 	}
@@ -1162,7 +1403,7 @@ func main() {
 	defer stop()
 
 	log.Printf(
-		"watcher polling every %s for VirtualClusterInstances -> apps namespace %s, cluster secrets namespace %s, template %q, patch application health=%v, wake on sync=%v",
+		"watcher polling every %s for VirtualClusterInstances -> apps namespace %s, cluster secrets namespace %s, template %q, patch application health=%v, wake requester configured=%v",
 		cfg.pollInterval,
 		cfg.argocdApplicationNamespace,
 		cfg.argocdClusterSecretNamespace,

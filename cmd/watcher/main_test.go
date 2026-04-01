@@ -550,10 +550,132 @@ func TestApplicationsByDestinationName(t *testing.T) {
 	}
 }
 
+func TestApplicationsByAuthorizedStage(t *testing.T) {
+	apps := []application{
+		{
+			Metadata: metadata{
+				Name: "guestbook-pre-prod",
+				Annotations: map[string]string{
+					kargoAuthorizedStageAnnotation: "pre-prod-gate:pre-prod",
+				},
+			},
+		},
+		{
+			Metadata: metadata{
+				Name: "guestbook-prod",
+				Annotations: map[string]string{
+					kargoAuthorizedStageAnnotation: "pre-prod-gate:prod",
+				},
+			},
+		},
+		{
+			Metadata: metadata{
+				Name: "plain-app",
+			},
+		},
+	}
+
+	indexed := applicationsByAuthorizedStage(apps)
+
+	if got := len(indexed["pre-prod-gate/pre-prod"]); got != 1 {
+		t.Fatalf("expected 1 app for pre-prod stage, got %d", got)
+	}
+	if got := len(indexed["pre-prod-gate/prod"]); got != 1 {
+		t.Fatalf("expected 1 app for prod stage, got %d", got)
+	}
+	if _, ok := indexed[""]; ok {
+		t.Fatal("did not expect empty stage key to be indexed")
+	}
+}
+
 func TestClusterSecretNameTemplate(t *testing.T) {
 	got := clusterSecretName("loft-{project}-vcluster-{virtualcluster}", "demo", "team-a")
 	if got != "loft-demo-vcluster-team-a" {
 		t.Fatalf("expected templated secret name, got %q", got)
+	}
+}
+
+func TestKargoWakeTriggersByDestination(t *testing.T) {
+	apps := []application{
+		{
+			Metadata: metadata{
+				Name: "guestbook-pre-prod",
+				Annotations: map[string]string{
+					kargoAuthorizedStageAnnotation: "pre-prod-gate:pre-prod",
+				},
+			},
+			Spec: applicationSpec{
+				Destination: applicationDestination{Name: "loft-default-vcluster-pre-prod-gate-pre-prod"},
+			},
+		},
+	}
+
+	promotions := []promotion{
+		{
+			Metadata: metadata{
+				Name:      "pre-prod.abc123",
+				Namespace: "pre-prod-gate",
+			},
+			Spec: promotionSpec{
+				Stage: "pre-prod",
+				Steps: []promotionStep{{Uses: "argocd-update"}},
+			},
+			Status: promotionStatus{Phase: "Running"},
+		},
+	}
+
+	triggers := kargoWakeTriggersByDestination(apps, promotions)
+	trigger, ok := triggers["loft-default-vcluster-pre-prod-gate-pre-prod"]
+	if !ok {
+		t.Fatal("expected Kargo wake trigger for destination")
+	}
+	if len(trigger.Apps) != 1 || trigger.Apps[0].Metadata.Name != "guestbook-pre-prod" {
+		t.Fatalf("unexpected trigger apps: %#v", trigger.Apps)
+	}
+	if len(trigger.PromotionNames) != 1 || trigger.PromotionNames[0] != "pre-prod.abc123" {
+		t.Fatalf("unexpected promotion names: %#v", trigger.PromotionNames)
+	}
+	if trigger.Fingerprint == "" {
+		t.Fatal("expected non-empty trigger fingerprint")
+	}
+}
+
+func TestKargoWakeTriggersIgnoreTerminalAndNonArgoPromotions(t *testing.T) {
+	apps := []application{
+		{
+			Metadata: metadata{
+				Name: "guestbook-pre-prod",
+				Annotations: map[string]string{
+					kargoAuthorizedStageAnnotation: "pre-prod-gate:pre-prod",
+				},
+			},
+			Spec: applicationSpec{
+				Destination: applicationDestination{Name: "loft-default-vcluster-pre-prod-gate-pre-prod"},
+			},
+		},
+	}
+
+	promotions := []promotion{
+		{
+			Metadata: metadata{Name: "pre-prod.done", Namespace: "pre-prod-gate"},
+			Spec: promotionSpec{
+				Stage: "pre-prod",
+				Steps: []promotionStep{{Uses: "argocd-update"}},
+			},
+			Status: promotionStatus{Phase: "Succeeded"},
+		},
+		{
+			Metadata: metadata{Name: "pre-prod.non-argocd", Namespace: "pre-prod-gate"},
+			Spec: promotionSpec{
+				Stage: "pre-prod",
+				Steps: []promotionStep{{Uses: "git-clone"}},
+			},
+			Status: promotionStatus{Phase: "Running"},
+		},
+	}
+
+	if triggers := kargoWakeTriggersByDestination(apps, promotions); len(triggers) != 0 {
+		t.Fatalf("expected no wake triggers, got %#v", triggers)
 	}
 }
 
@@ -622,14 +744,14 @@ func TestReconcileVCITriggersWakeOncePerObservedSyncIntent(t *testing.T) {
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
 		t.Fatalf("expected one wake call after new sync intent, got %d", wakeCalls)
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
 		t.Fatalf("unexpected reconcile error on second pass: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -693,11 +815,120 @@ func TestReconcileVCIRetriesWakeAfterCooldownWhenSyncIntentPersists(t *testing.T
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
 		t.Fatalf("expected one retry wake call, got %d", wakeCalls)
+	}
+}
+
+func TestReconcileVCITriggersWakeForActiveKargoPromotionBeforeSyncIntent(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"metadata":{"annotations":{"argocd.argoproj.io/skip-reconcile":"true"}}}`))
+	}))
+	defer apiServer.Close()
+
+	wakeCalls := 0
+	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wakeCalls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer wakeServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		wakeRequester: &wakeRequester{
+			client:           wakeServer.Client(),
+			baseURL:          wakeServer.URL,
+			acceptedStatuses: parseStatusSet("502,504"),
+		},
+		wakeRetryInterval:            time.Hour,
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+			Annotations: map[string]string{
+				sleepingSinceAnnotation: "1711800000",
+			},
+		},
+	}
+	appsByDestination := map[string][]application{
+		secretName: {
+			{
+				Metadata: metadata{
+					Name: "guestbook-pre-prod",
+					Annotations: map[string]string{
+						kargoAuthorizedStageAnnotation: "pre-prod-gate:pre-prod",
+					},
+				},
+			},
+		},
+	}
+	kargoWakeTriggers := map[string]kargoWakeTrigger{
+		secretName: {
+			Apps: []application{
+				{
+					Metadata: metadata{Name: "guestbook-pre-prod"},
+				},
+			},
+			PromotionNames: []string{"pre-prod.abc123"},
+			Fingerprint:    "pre-prod.abc123",
+		},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, kargoWakeTriggers); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("expected wake call from active Kargo Promotion, got %d", wakeCalls)
+	}
+	if got := runtime.observedKargoPromotions[secretName]; got != "pre-prod.abc123" {
+		t.Fatalf("expected observed Kargo promotion fingerprint to be remembered, got %q", got)
+	}
+}
+
+func TestListPromotionsOptionalTreatsMissingKargoAsUnsupported(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apis/kargo.akuity.io/v1alpha1/promotions" {
+			t.Fatalf("unexpected API path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"the server could not find the requested resource"}`))
+	}))
+	defer apiServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+	}
+	runtime := newWatcherRuntime()
+
+	promotions, err := listPromotionsOptional(context.Background(), &cfg, runtime)
+	if err != nil {
+		t.Fatalf("unexpected error listing optional promotions: %v", err)
+	}
+	if len(promotions) != 0 {
+		t.Fatalf("expected no promotions when Kargo is unavailable, got %#v", promotions)
+	}
+	if !runtime.kargoPromotionsChecked || runtime.kargoPromotionsAvailable {
+		t.Fatalf("expected Kargo promotion discovery to be marked unavailable, got checked=%v available=%v", runtime.kargoPromotionsChecked, runtime.kargoPromotionsAvailable)
 	}
 }
 
