@@ -81,8 +81,9 @@ type wakeRequester struct {
 }
 
 type watcherRuntime struct {
-	observedSyncIntents map[string]string
-	lastWakeAttempt     map[string]time.Time
+	observedSyncIntents  map[string]string
+	lastWakeAttempt      map[string]time.Time
+	lastKnownKargoHealth map[string]healthStatus
 }
 
 type metadata struct {
@@ -437,8 +438,9 @@ func (w *wakeRequester) Execute(ctx context.Context, project, virtualCluster str
 
 func newWatcherRuntime() *watcherRuntime {
 	return &watcherRuntime{
-		observedSyncIntents: map[string]string{},
-		lastWakeAttempt:     map[string]time.Time{},
+		observedSyncIntents:  map[string]string{},
+		lastWakeAttempt:      map[string]time.Time{},
+		lastKnownKargoHealth: map[string]healthStatus{},
 	}
 }
 
@@ -711,14 +713,12 @@ func classifyVCI(vci virtualClusterInstance, secretPaused bool) vciState {
 }
 
 func applicationHasManagedHealth(app application, cfg watcherConfig) bool {
-	switch {
-	case app.Status.Health.Status == "Suspended" && app.Status.Health.Message == cfg.sleepingHealthMessage:
-		return true
-	case app.Status.Health.Status == "Progressing" && app.Status.Health.Message == cfg.wakingHealthMessage:
-		return true
-	default:
+	message := strings.TrimSpace(app.Status.Health.Message)
+	if message == "" {
 		return false
 	}
+
+	return message == cfg.sleepingHealthMessage || message == cfg.wakingHealthMessage
 }
 
 func applicationIsKargoManaged(app application) bool {
@@ -853,52 +853,114 @@ func patchApplicationHealth(ctx context.Context, cfg *watcherConfig, name, statu
 	}
 }
 
+func patchApplicationHealthValue(ctx context.Context, cfg *watcherConfig, app application, desired healthStatus) error {
+	if app.Status.Health.Status == desired.Status && app.Status.Health.Message == desired.Message {
+		return nil
+	}
+
+	if err := patchApplicationHealth(ctx, cfg, app.Metadata.Name, desired.Status, desired.Message); err != nil {
+		var statusErr *apiStatusError
+		if errors.As(err, &statusErr) {
+			switch statusErr.StatusCode {
+			case http.StatusNotFound:
+				_, getErr := cfg.api.getApplication(ctx, cfg.argocdApplicationNamespace, app.Metadata.Name)
+				if getErr == nil && cfg.applicationHealthPatchMode == applicationHealthPatchModeStatus {
+					cfg.applicationHealthPatchMode = applicationHealthPatchModeApplication
+					log.Printf("application %s exists but /status patch returned 404; falling back to patching status on the Application resource itself", app.Metadata.Name)
+
+					if fallbackErr := patchApplicationHealth(ctx, cfg, app.Metadata.Name, desired.Status, desired.Message); fallbackErr == nil {
+						log.Printf("set application %s health to %s (%s)", app.Metadata.Name, desired.Status, desired.Message)
+						return nil
+					} else {
+						err = fallbackErr
+						if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusForbidden || statusErr.StatusCode == http.StatusMethodNotAllowed) {
+							disableApplicationHealthPatching(cfg, fmt.Sprintf("fallback status patch for Application %s failed with %s; check Argo CD RBAC, or set WATCH_PATCH_APPLICATION_HEALTH=false.", app.Metadata.Name, statusErr.Status))
+							return nil
+						}
+					}
+				}
+
+				var getStatusErr *apiStatusError
+				if errors.As(getErr, &getStatusErr) && getStatusErr.StatusCode == http.StatusNotFound {
+					log.Printf("application %s disappeared before health patch; skipping", app.Metadata.Name)
+					return nil
+				}
+			case http.StatusForbidden, http.StatusMethodNotAllowed:
+				disableApplicationHealthPatching(cfg, fmt.Sprintf("status patch for Application %s failed with %s; check Argo CD CRD subresources and RBAC, or set WATCH_PATCH_APPLICATION_HEALTH=false.", app.Metadata.Name, statusErr.Status))
+				return nil
+			}
+		}
+
+		return fmt.Errorf("patch application %s health: %w", app.Metadata.Name, err)
+	}
+	log.Printf("set application %s health to %s (%s)", app.Metadata.Name, desired.Status, desired.Message)
+
+	return nil
+}
+
 func patchApplicationsHealth(ctx context.Context, cfg *watcherConfig, apps []application, status, message string) error {
+	desired := healthStatus{Status: status, Message: message}
 	for _, app := range apps {
 		if applicationIsKargoManaged(app) {
 			continue
 		}
+		if err := patchApplicationHealthValue(ctx, cfg, app, desired); err != nil {
+			return err
+		}
+	}
 
-		if app.Status.Health.Status == status && app.Status.Health.Message == message {
+	return nil
+}
+
+func rememberKargoApplicationsHealth(runtime *watcherRuntime, apps []application, cfg watcherConfig) {
+	if runtime == nil {
+		return
+	}
+
+	for _, app := range apps {
+		if !applicationIsKargoManaged(app) {
+			continue
+		}
+		if applicationHasManagedHealth(app, cfg) {
+			continue
+		}
+		runtime.lastKnownKargoHealth[app.Metadata.Name] = app.Status.Health
+	}
+}
+
+func desiredKargoApplicationHealth(runtime *watcherRuntime, app application, cfg watcherConfig) (healthStatus, bool) {
+	if runtime != nil {
+		if desired, ok := runtime.lastKnownKargoHealth[app.Metadata.Name]; ok && strings.TrimSpace(desired.Status) != "" {
+			return desired, true
+		}
+	}
+
+	if applicationHasManagedHealth(app, cfg) && app.Status.Health.Status == "Healthy" {
+		return healthStatus{Status: "Healthy", Message: ""}, true
+	}
+
+	return healthStatus{}, false
+}
+
+func restoreKargoApplicationsHealth(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime, apps []application) error {
+	for _, app := range apps {
+		if !applicationIsKargoManaged(app) {
+			continue
+		}
+		if applicationSyncIntentFingerprint(app) != "" {
 			continue
 		}
 
-		if err := patchApplicationHealth(ctx, cfg, app.Metadata.Name, status, message); err != nil {
-			var statusErr *apiStatusError
-			if errors.As(err, &statusErr) {
-				switch statusErr.StatusCode {
-				case http.StatusNotFound:
-					_, getErr := cfg.api.getApplication(ctx, cfg.argocdApplicationNamespace, app.Metadata.Name)
-					if getErr == nil && cfg.applicationHealthPatchMode == applicationHealthPatchModeStatus {
-						cfg.applicationHealthPatchMode = applicationHealthPatchModeApplication
-						log.Printf("application %s exists but /status patch returned 404; falling back to patching status on the Application resource itself", app.Metadata.Name)
-
-						if fallbackErr := patchApplicationHealth(ctx, cfg, app.Metadata.Name, status, message); fallbackErr == nil {
-							log.Printf("set application %s health to %s (%s)", app.Metadata.Name, status, message)
-							continue
-						} else {
-							err = fallbackErr
-							if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusForbidden || statusErr.StatusCode == http.StatusMethodNotAllowed) {
-								disableApplicationHealthPatching(cfg, fmt.Sprintf("fallback status patch for Application %s failed with %s; check Argo CD RBAC, or set WATCH_PATCH_APPLICATION_HEALTH=false.", app.Metadata.Name, statusErr.Status))
-								return nil
-							}
-						}
-					}
-
-					var getStatusErr *apiStatusError
-					if errors.As(getErr, &getStatusErr) && getStatusErr.StatusCode == http.StatusNotFound {
-						log.Printf("application %s disappeared before health patch; skipping", app.Metadata.Name)
-						continue
-					}
-				case http.StatusForbidden, http.StatusMethodNotAllowed:
-					disableApplicationHealthPatching(cfg, fmt.Sprintf("status patch for Application %s failed with %s; check Argo CD CRD subresources and RBAC, or set WATCH_PATCH_APPLICATION_HEALTH=false.", app.Metadata.Name, statusErr.Status))
-					return nil
-				}
-			}
-
-			return fmt.Errorf("patch application %s health: %w", app.Metadata.Name, err)
+		desired, ok := desiredKargoApplicationHealth(runtime, app, *cfg)
+		if !ok {
+			continue
 		}
-		log.Printf("set application %s health to %s (%s)", app.Metadata.Name, status, message)
+		if err := patchApplicationHealthValue(ctx, cfg, app, desired); err != nil {
+			return err
+		}
+		if runtime != nil && strings.TrimSpace(desired.Status) != "" {
+			runtime.lastKnownKargoHealth[app.Metadata.Name] = desired
+		}
 	}
 
 	return nil
@@ -949,6 +1011,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 
 	switch state {
 	case vciStateSleeping:
+		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		if clusterSecret != nil && !secretPaused {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, true); err != nil {
 				return fmt.Errorf("pause cluster secret %s/%s: %w", cfg.argocdClusterSecretNamespace, secretName, err)
@@ -987,9 +1050,13 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			if err := patchApplicationsHealth(ctx, cfg, apps, "Suspended", cfg.sleepingHealthMessage); err != nil {
 				return err
 			}
+			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps); err != nil {
+				return err
+			}
 		}
 	case vciStateWaking:
 		rememberSyncIntentApplications(runtime, syncIntentApps)
+		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		if clusterSecret != nil && !secretPaused {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, true); err != nil {
 				return fmt.Errorf("pause cluster secret %s/%s during wake: %w", cfg.argocdClusterSecretNamespace, secretName, err)
@@ -1000,8 +1067,12 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			if err := patchApplicationsHealth(ctx, cfg, apps, "Progressing", cfg.wakingHealthMessage); err != nil {
 				return err
 			}
+			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps); err != nil {
+				return err
+			}
 		}
 	case vciStateReady:
+		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		readyTransition := secretPaused || applicationsNeedReadyRefresh(apps, *cfg)
 		rememberSyncIntentApplications(runtime, syncIntentApps)
 
@@ -1014,6 +1085,11 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 
 		if readyTransition {
 			if err := annotateApplicationsHardRefresh(ctx, cfg, apps); err != nil {
+				return err
+			}
+		}
+		if cfg.patchApplicationHealth {
+			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps); err != nil {
 				return err
 			}
 		}

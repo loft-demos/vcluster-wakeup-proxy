@@ -76,7 +76,7 @@ Important watcher settings:
 
 The example watcher Deployment uses `WATCH_POLL_INTERVAL=2s` so it can react quickly when a vCluster transitions into sleep.
 
-Application health patching is enabled by default so non-Kargo apps show a helpful `Suspended` or `Progressing` status in Argo CD while their destination vCluster is asleep or waking. Apps annotated with `kargo.akuity.io/authorized-stage` are automatically excluded so the watcher does not force Kargo-managed apps into an artificial health state. Set `WATCH_PATCH_APPLICATION_HEALTH=false` to disable health patching entirely.
+Application health patching is enabled by default so non-Kargo apps show a helpful `Suspended` or `Progressing` status in Argo CD while their destination vCluster is asleep or waking. Apps annotated with `kargo.akuity.io/authorized-stage` are treated specially: the watcher preserves their last non-watcher health while the destination is dormant and clears stale watcher-managed sleep messages once the destination is ready again. Set `WATCH_PATCH_APPLICATION_HEALTH=false` to disable health patching entirely.
 
 If your cluster does not expose the `applications/status` subresource, the watcher falls back to patching the `Application` resource itself. If that still is not allowed in your cluster, it automatically disables health patching and continues managing cluster-secret pause/unpause plus app refresh.
 

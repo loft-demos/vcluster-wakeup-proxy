@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -207,6 +208,11 @@ func TestApplicationsNeedReadyRefreshOnlyForManagedHealth(t *testing.T) {
 		t.Fatal("expected ready refresh for managed health")
 	}
 
+	apps[0].Status.Health.Status = "Healthy"
+	if !applicationsNeedReadyRefresh(apps, cfg) {
+		t.Fatal("expected ready refresh for stale managed health message")
+	}
+
 	apps[0].Status.Health.Message = "manual override"
 	if applicationsNeedReadyRefresh(apps, cfg) {
 		t.Fatal("did not expect ready refresh for unrelated app health")
@@ -256,6 +262,116 @@ func TestPatchApplicationsHealthSkipsKargoManagedApps(t *testing.T) {
 	}
 	if !strings.HasSuffix(patched[0], "/applications/plain-app/status") {
 		t.Fatalf("expected only non-Kargo app to be patched, got %q", patched[0])
+	}
+}
+
+func TestRestoreKargoApplicationsHealthUsesLastKnownHealthyState(t *testing.T) {
+	var patchedBodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Fatalf("expected PATCH request, got %s", r.Method)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read patch body: %v", err)
+		}
+		patchedBodies = append(patchedBodies, string(body))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      server.Client(),
+			apiBase:     server.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace: "argocd",
+		patchApplicationHealth:     true,
+		applicationHealthPatchMode: applicationHealthPatchModeStatus,
+		sleepingHealthMessage:      "vCluster sleeping",
+		wakingHealthMessage:        "vCluster waking",
+	}
+	runtime := newWatcherRuntime()
+	runtime.lastKnownKargoHealth["kargo-app"] = healthStatus{Status: "Healthy"}
+
+	apps := []application{
+		{
+			Metadata: metadata{
+				Name: "kargo-app",
+				Annotations: map[string]string{
+					kargoAuthorizedStageAnnotation: "demo:pre-prod",
+				},
+			},
+			Status: applicationStatus{
+				Health: healthStatus{
+					Status:  "Progressing",
+					Message: "vCluster sleeping",
+				},
+			},
+		},
+	}
+
+	if err := restoreKargoApplicationsHealth(context.Background(), &cfg, runtime, apps); err != nil {
+		t.Fatalf("unexpected restore error: %v", err)
+	}
+
+	if len(patchedBodies) != 1 {
+		t.Fatalf("expected one Kargo health restore patch, got %d", len(patchedBodies))
+	}
+	if !strings.Contains(patchedBodies[0], `"status":"Healthy"`) {
+		t.Fatalf("expected restore patch to set Healthy status, got %s", patchedBodies[0])
+	}
+}
+
+func TestRestoreKargoApplicationsHealthSkipsActiveSyncIntent(t *testing.T) {
+	var patched bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		patched = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      server.Client(),
+			apiBase:     server.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace: "argocd",
+		patchApplicationHealth:     true,
+		applicationHealthPatchMode: applicationHealthPatchModeStatus,
+		sleepingHealthMessage:      "vCluster sleeping",
+		wakingHealthMessage:        "vCluster waking",
+	}
+	runtime := newWatcherRuntime()
+	runtime.lastKnownKargoHealth["kargo-app"] = healthStatus{Status: "Healthy"}
+
+	apps := []application{
+		{
+			Metadata: metadata{
+				Name: "kargo-app",
+				Annotations: map[string]string{
+					kargoAuthorizedStageAnnotation: "demo:pre-prod",
+				},
+			},
+			Status: applicationStatus{
+				Health: healthStatus{
+					Status:  "Progressing",
+					Message: "vCluster sleeping",
+				},
+			},
+			Operation: &applicationOperation{
+				Sync: json.RawMessage(`{"revision":"abc123"}`),
+			},
+		},
+	}
+
+	if err := restoreKargoApplicationsHealth(context.Background(), &cfg, runtime, apps); err != nil {
+		t.Fatalf("unexpected restore error: %v", err)
+	}
+	if patched {
+		t.Fatal("did not expect Kargo health restore while sync intent is active")
 	}
 }
 
