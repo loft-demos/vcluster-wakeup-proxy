@@ -89,6 +89,37 @@ When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats active Kargo `Promoti
 
 Build the watcher image with [Dockerfile.watcher](Dockerfile.watcher).
 
+## Akuity-Hosted Phase 1 (Optional Alternative)
+
+When Argo CD and/or Kargo are hosted by Akuity, the watcher-first flow above is no
+longer the best fit because it assumes direct Kubernetes API access to:
+
+- `VirtualClusterInstance` resources
+- Argo CD `Application` resources
+- Argo CD imported cluster `Secret` resources
+- optional Kargo `Promotion` resources
+
+For hosted control planes, a lower-risk Phase 1 pattern is to keep the current
+self-hosted watcher solution unchanged and add a separate Kargo-agent-driven wake
+path instead:
+
+- run a self-hosted Kargo agent in the vCluster management cluster
+- assign sleeping-vCluster `Stage`s to that agent with `spec.shard`
+- add an explicit `wake-vcluster` task immediately before `argocd-update`
+- point that task at `cmd/proxy` or another readiness-aware wake facade
+
+That gives Kargo a deterministic pre-sync wake step without requiring this watcher
+to mutate hosted Argo CD cluster secrets.
+
+Ready-to-adapt examples live in [examples/akuity-selfhosted-agent](examples/akuity-selfhosted-agent):
+
+- [examples/akuity-selfhosted-agent/cluster-promotion-task-wake-vcluster.yaml](examples/akuity-selfhosted-agent/cluster-promotion-task-wake-vcluster.yaml)
+- [examples/akuity-selfhosted-agent/project-secret-vcluster-platform.yaml](examples/akuity-selfhosted-agent/project-secret-vcluster-platform.yaml)
+- [examples/akuity-selfhosted-agent/stage-example.yaml](examples/akuity-selfhosted-agent/stage-example.yaml)
+
+This Akuity path is additive. It does not change the existing self-hosted
+`cmd/watcher` or optional `cmd/proxy` flow documented above.
+
 ## Optional Wake Proxy
 
 `cmd/proxy` is a small HTTP proxy for forwarding requests to a vCluster Platform upstream while handling sleeping virtual cluster wake requests more gracefully.

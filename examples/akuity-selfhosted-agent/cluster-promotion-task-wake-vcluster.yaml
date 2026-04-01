@@ -1,0 +1,23 @@
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ClusterPromotionTask
+metadata:
+  name: wake-vcluster
+spec:
+  vars:
+    - name: wakeBaseURL
+      value: http://vcluster-wakeup-proxy.argocd.svc.cluster.local:8080
+    - name: project
+    - name: virtualCluster
+    - name: timeout
+      value: 45s
+  steps:
+    - uses: http
+      retry:
+        timeout: 5m
+      config:
+        method: POST
+        url: ${{ vars.wakeBaseURL }}/kubernetes/project/${{ vars.project }}/virtualcluster/${{ vars.virtualCluster }}
+        timeout: ${{ vars.timeout }}
+        headers:
+          - name: Authorization
+            value: Bearer ${{ secret('vcluster-platform').token }}

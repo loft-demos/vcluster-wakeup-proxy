@@ -1,0 +1,32 @@
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: pre-prod
+  namespace: pre-prod-gate
+spec:
+  shard: vcp-selfhosted
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: guestbook
+  promotionTemplate:
+    spec:
+      steps:
+        # In a real template, keep your existing Git/render steps before this task.
+        - task:
+            name: wake-vcluster
+            kind: ClusterPromotionTask
+          vars:
+            - name: project
+              value: default
+            - name: virtualCluster
+              value: pre-prod-gate-pre-prod
+            - name: wakeBaseURL
+              value: http://vcluster-wakeup-proxy.argocd.svc.cluster.local:8080
+        - uses: argocd-update
+          retry:
+            timeout: 10m
+          config:
+            apps:
+              - name: guestbook-ppg-pre-prod
+                namespace: argocd
