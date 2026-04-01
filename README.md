@@ -1,6 +1,6 @@
-# vcluster-wakeup-proxy
+# vcluster-gitops-watcher
 
-`vcluster-wakeup-proxy` now centers on the `VirtualClusterInstance` watcher for Argo CD `v3.4.0-rc1` or newer.
+`vcluster-gitops-watcher` centers on the `VirtualClusterInstance` watcher for Argo CD `v3.4.0-rc1` or newer.
 
 The recommended architecture is:
 
@@ -52,7 +52,7 @@ With that watcher-first flow, Argo CD Notifications and Kargo `http` steps are n
 
 ### Watcher Configuration
 
-Ready-to-apply example manifests are included in [deploy/watcher-rbac.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/watcher-rbac.yaml) and [deploy/watcher-deployment.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/watcher-deployment.yaml).
+Ready-to-apply example manifests are included in [deploy/watcher-rbac.yaml](deploy/watcher-rbac.yaml) and [deploy/watcher-deployment.yaml](deploy/watcher-deployment.yaml).
 
 Important watcher settings:
 
@@ -87,7 +87,7 @@ If your cluster does not expose the `applications/status` subresource, the watch
 
 When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats active Kargo `Promotion`s that use `argocd-update` as the earliest wake signal for sleeping destinations and still uses `Application.operation.sync` as a fallback. If you already run `cmd/proxy`, you can point `WATCH_WAKE_UPSTREAM_BASE` at the proxy service so the watcher reuses the proxy's tolerant wake semantics for transient `502` / `504` responses. If you do not need that behavior, point the watcher directly at the vCluster Platform API instead.
 
-Build the watcher image with [Dockerfile.watcher](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/Dockerfile.watcher).
+Build the watcher image with [Dockerfile.watcher](Dockerfile.watcher).
 
 ## Optional Wake Proxy
 
@@ -192,7 +192,7 @@ With that configuration, a wake-triggering `POST /kubernetes/project/.../virtual
 - For vCluster Platform-managed Argo cluster secrets, the expected template is typically `loft-{project}-vcluster-{virtualcluster}`. For example, project `demos` plus vCluster `jf-demo` becomes `loft-demos-vcluster-jf-demo`.
 - The proxy patches the Kubernetes API directly, which keeps the implementation small and avoids a hard dependency on Argo's API surface.
 
-Ready-to-apply example manifests are included in [deploy/argocd-rbac.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/argocd-rbac.yaml), [deploy/deployment.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/deployment.yaml), and [deploy/service.yaml](/Users/kmadel/Library%20Mobile%20Documents/com~apple~CloudDocs/projects/loft-demos/vcluster-wakeup-proxy/deploy/service.yaml).
+Ready-to-apply example manifests are included in [deploy/argocd-rbac.yaml](deploy/argocd-rbac.yaml), [deploy/deployment.yaml](deploy/deployment.yaml), and [deploy/service.yaml](deploy/service.yaml).
 
 Update the example Deployment before applying it:
 

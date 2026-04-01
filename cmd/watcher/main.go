@@ -1393,6 +1393,14 @@ func run(ctx context.Context, cfg *watcherConfig) error {
 	}
 }
 
+func describeWakeSources(cfg watcherConfig) string {
+	if cfg.wakeRequester == nil {
+		return "disabled"
+	}
+
+	return "kargo-promotions(auto-detect cluster-wide),argocd-sync"
+}
+
 func main() {
 	cfg, err := loadWatcherConfig()
 	if err != nil {
@@ -1403,13 +1411,13 @@ func main() {
 	defer stop()
 
 	log.Printf(
-		"watcher polling every %s for VirtualClusterInstances -> apps namespace %s, cluster secrets namespace %s, template %q, patch application health=%v, wake requester configured=%v",
+		"watcher polling every %s for VirtualClusterInstances -> apps namespace %s, cluster secrets namespace %s, template %q, patch application health=%v, wake sources=%s",
 		cfg.pollInterval,
 		cfg.argocdApplicationNamespace,
 		cfg.argocdClusterSecretNamespace,
 		cfg.clusterSecretNameTemplate,
 		cfg.patchApplicationHealth,
-		cfg.wakeRequester != nil,
+		describeWakeSources(cfg),
 	)
 
 	if err := run(ctx, &cfg); err != nil && !errors.Is(err, context.Canceled) {

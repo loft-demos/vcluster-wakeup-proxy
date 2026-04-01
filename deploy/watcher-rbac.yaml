@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: vcluster-wakeup-watcher
+  name: vcluster-gitops-watcher
   namespace: argocd
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: vcluster-wakeup-watcher-vci-read
+  name: vcluster-gitops-watcher-vci-read
 rules:
   - apiGroups: ["management.loft.sh"]
     resources: ["virtualclusterinstances"]
@@ -19,20 +19,20 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: vcluster-wakeup-watcher-vci-read
+  name: vcluster-gitops-watcher-vci-read
 subjects:
   - kind: ServiceAccount
-    name: vcluster-wakeup-watcher
+    name: vcluster-gitops-watcher
     namespace: argocd
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: vcluster-wakeup-watcher-vci-read
+  name: vcluster-gitops-watcher-vci-read
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: vcluster-wakeup-watcher-argocd-write
+  name: vcluster-gitops-watcher-argocd-write
   namespace: argocd
 rules:
   - apiGroups: [""]
@@ -48,13 +48,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: vcluster-wakeup-watcher-argocd-write
+  name: vcluster-gitops-watcher-argocd-write
   namespace: argocd
 subjects:
   - kind: ServiceAccount
-    name: vcluster-wakeup-watcher
+    name: vcluster-gitops-watcher
     namespace: argocd
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: vcluster-wakeup-watcher-argocd-write
+  name: vcluster-gitops-watcher-argocd-write

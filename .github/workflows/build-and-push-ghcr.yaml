@@ -33,7 +33,7 @@ jobs:
         include:
           - image_name: vcluster-wakeup-proxy
             dockerfile: ./Dockerfile
-          - image_name: vcluster-wakeup-watcher
+          - image_name: vcluster-gitops-watcher
             dockerfile: ./Dockerfile.watcher
 
     steps:
