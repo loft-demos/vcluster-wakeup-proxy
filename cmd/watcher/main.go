@@ -932,21 +932,24 @@ func rememberKargoApplicationsHealth(runtime *watcherRuntime, apps []application
 	}
 }
 
-func desiredKargoApplicationHealth(runtime *watcherRuntime, app application, cfg watcherConfig) (healthStatus, bool) {
+func desiredKargoApplicationHealth(runtime *watcherRuntime, app application, cfg watcherConfig, dormantMessage string) (healthStatus, bool) {
 	if runtime != nil {
 		if desired, ok := runtime.lastKnownKargoHealth[app.Metadata.Name]; ok && strings.TrimSpace(desired.Status) != "" {
+			if desired.Status == "Healthy" {
+				desired.Message = dormantMessage
+			}
 			return desired, true
 		}
 	}
 
 	if applicationHasManagedHealth(app, cfg) && app.Status.Health.Status == "Healthy" {
-		return healthStatus{Status: "Healthy", Message: ""}, true
+		return healthStatus{Status: "Healthy", Message: dormantMessage}, true
 	}
 
 	return healthStatus{}, false
 }
 
-func restoreKargoApplicationsHealth(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime, apps []application) error {
+func restoreKargoApplicationsHealth(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime, apps []application, dormantMessage string) error {
 	for _, app := range apps {
 		if !applicationIsKargoManaged(app) {
 			continue
@@ -955,7 +958,7 @@ func restoreKargoApplicationsHealth(ctx context.Context, cfg *watcherConfig, run
 			continue
 		}
 
-		desired, ok := desiredKargoApplicationHealth(runtime, app, *cfg)
+		desired, ok := desiredKargoApplicationHealth(runtime, app, *cfg, dormantMessage)
 		if !ok {
 			continue
 		}
@@ -1054,7 +1057,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			if err := patchApplicationsHealth(ctx, cfg, apps, "Suspended", cfg.sleepingHealthMessage); err != nil {
 				return err
 			}
-			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps); err != nil {
+			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps, cfg.sleepingHealthMessage); err != nil {
 				return err
 			}
 		}
@@ -1071,7 +1074,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			if err := patchApplicationsHealth(ctx, cfg, apps, "Progressing", cfg.wakingHealthMessage); err != nil {
 				return err
 			}
-			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps); err != nil {
+			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps, cfg.wakingHealthMessage); err != nil {
 				return err
 			}
 		}
@@ -1093,7 +1096,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			}
 		}
 		if cfg.patchApplicationHealth {
-			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps); err != nil {
+			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps, ""); err != nil {
 				return err
 			}
 		}

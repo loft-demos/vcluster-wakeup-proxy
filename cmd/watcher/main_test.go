@@ -265,7 +265,7 @@ func TestPatchApplicationsHealthSkipsKargoManagedApps(t *testing.T) {
 	}
 }
 
-func TestRestoreKargoApplicationsHealthUsesLastKnownHealthyState(t *testing.T) {
+func TestRestoreKargoApplicationsHealthUsesLastKnownHealthyStateWithDormantMessage(t *testing.T) {
 	var patchedBodies []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch {
@@ -312,7 +312,7 @@ func TestRestoreKargoApplicationsHealthUsesLastKnownHealthyState(t *testing.T) {
 		},
 	}
 
-	if err := restoreKargoApplicationsHealth(context.Background(), &cfg, runtime, apps); err != nil {
+	if err := restoreKargoApplicationsHealth(context.Background(), &cfg, runtime, apps, "vCluster sleeping"); err != nil {
 		t.Fatalf("unexpected restore error: %v", err)
 	}
 
@@ -321,6 +321,9 @@ func TestRestoreKargoApplicationsHealthUsesLastKnownHealthyState(t *testing.T) {
 	}
 	if !strings.Contains(patchedBodies[0], `"status":"Healthy"`) {
 		t.Fatalf("expected restore patch to set Healthy status, got %s", patchedBodies[0])
+	}
+	if !strings.Contains(patchedBodies[0], `"message":"vCluster sleeping"`) {
+		t.Fatalf("expected restore patch to carry dormancy message, got %s", patchedBodies[0])
 	}
 }
 
@@ -367,11 +370,67 @@ func TestRestoreKargoApplicationsHealthSkipsActiveSyncIntent(t *testing.T) {
 		},
 	}
 
-	if err := restoreKargoApplicationsHealth(context.Background(), &cfg, runtime, apps); err != nil {
+	if err := restoreKargoApplicationsHealth(context.Background(), &cfg, runtime, apps, "vCluster sleeping"); err != nil {
 		t.Fatalf("unexpected restore error: %v", err)
 	}
 	if patched {
 		t.Fatal("did not expect Kargo health restore while sync intent is active")
+	}
+}
+
+func TestRestoreKargoApplicationsHealthClearsDormantMessageWhenReady(t *testing.T) {
+	var patchedBodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read patch body: %v", err)
+		}
+		patchedBodies = append(patchedBodies, string(body))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      server.Client(),
+			apiBase:     server.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace: "argocd",
+		patchApplicationHealth:     true,
+		applicationHealthPatchMode: applicationHealthPatchModeStatus,
+		sleepingHealthMessage:      "vCluster sleeping",
+		wakingHealthMessage:        "vCluster waking",
+	}
+	runtime := newWatcherRuntime()
+	runtime.lastKnownKargoHealth["kargo-app"] = healthStatus{Status: "Healthy"}
+
+	apps := []application{
+		{
+			Metadata: metadata{
+				Name: "kargo-app",
+				Annotations: map[string]string{
+					kargoAuthorizedStageAnnotation: "demo:pre-prod",
+				},
+			},
+			Status: applicationStatus{
+				Health: healthStatus{
+					Status:  "Healthy",
+					Message: "vCluster sleeping",
+				},
+			},
+		},
+	}
+
+	if err := restoreKargoApplicationsHealth(context.Background(), &cfg, runtime, apps, ""); err != nil {
+		t.Fatalf("unexpected restore error: %v", err)
+	}
+
+	if len(patchedBodies) != 1 {
+		t.Fatalf("expected one ready-state restore patch, got %d", len(patchedBodies))
+	}
+	if !strings.Contains(patchedBodies[0], `"status":"Healthy"`) || !strings.Contains(patchedBodies[0], `"message":""`) {
+		t.Fatalf("expected ready-state restore patch to clear dormancy message, got %s", patchedBodies[0])
 	}
 }
 
