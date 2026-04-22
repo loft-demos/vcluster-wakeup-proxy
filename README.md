@@ -32,6 +32,8 @@ It polls `VirtualClusterInstance` objects from the management cluster API and th
 
 Sleep detection prefers the platform-managed annotations `sleepmode.loft.sh/sleeping-since` and `sleepmode.loft.sh/sleep-type`, then falls back to `status.phase`, `status.reason`, `status.message`, and the `VirtualClusterOnline` condition.
 
+### Why Argo CD v3.4.0-rc1 or newer?
+
 The cluster-secret pause path is meant for Argo CD `v3.4.0-rc1` or newer, where cluster-secret `argocd.argoproj.io/skip-reconcile: "true"` is honored by the application controller.
 
 For Kargo, the deterministic trigger is a promotion template that ends with `argocd-update`. When Kargo `Promotion` objects are readable, the watcher wakes sleeping destinations from those active promotions before Argo CD finishes creating `Application.operation.sync`. If Kargo is not installed, or the watcher cannot read `Promotion` objects, it automatically falls back to Argo-only wake detection from `Application.operation.sync`.
