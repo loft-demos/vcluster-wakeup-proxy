@@ -973,6 +973,175 @@ func TestReconcileVCIRetriesWakeAfterCooldownWhenOutOfSyncRevisionPersists(t *te
 	}
 }
 
+func TestReconcileVCIUpdatesVCILastActivityOnWakeWhenEnabled(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	const vciStatusPath = "/apis/management.loft.sh/v1/namespaces/p-demo/virtualclusterinstances/team-a/status"
+
+	var patchBodies []string
+	before := time.Now().Unix()
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"metadata":{"annotations":{"argocd.argoproj.io/skip-reconcile":"true"}}}`))
+		case r.Method == http.MethodPatch && r.URL.Path == vciStatusPath:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read status patch body: %v", err)
+			}
+			patchBodies = append(patchBodies, string(body))
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected API request %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	wakeCalls := 0
+	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wakeCalls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer wakeServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		wakeRequester: &wakeRequester{
+			client:           wakeServer.Client(),
+			baseURL:          wakeServer.URL,
+			acceptedStatuses: parseStatusSet("502,504"),
+		},
+		updateVCILastActivityOnWake:  true,
+		wakeRetryInterval:            time.Hour,
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+			Annotations: map[string]string{
+				sleepingSinceAnnotation: "1711800000",
+			},
+		},
+	}
+	appsByDestination := map[string][]application{
+		secretName: {
+			{
+				Metadata: metadata{Name: "guestbook-pre-prod"},
+				Operation: &applicationOperation{
+					Sync: json.RawMessage(`{"revision":"abc123"}`),
+				},
+			},
+		},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("expected one wake call, got %d", wakeCalls)
+	}
+	if len(patchBodies) != 1 {
+		t.Fatalf("expected one VCI status patch, got %d", len(patchBodies))
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(patchBodies[0]), &payload); err != nil {
+		t.Fatalf("unmarshal status patch: %v", err)
+	}
+	status, _ := payload["status"].(map[string]any)
+	sleepModeConfig, _ := status["sleepModeConfig"].(map[string]any)
+	sleepStatus, _ := sleepModeConfig["status"].(map[string]any)
+	lastActivity, _ := sleepStatus["lastActivity"].(float64)
+	after := time.Now().Unix()
+	if int64(lastActivity) < before || int64(lastActivity) > after {
+		t.Fatalf("expected lastActivity to be patched to a current timestamp between %d and %d, got %v", before, after, lastActivity)
+	}
+}
+
+func TestReconcileVCIIgnoresVCILastActivityPatchFailure(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	const vciStatusPath = "/apis/management.loft.sh/v1/namespaces/p-demo/virtualclusterinstances/team-a/status"
+
+	patchCalls := 0
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"metadata":{"annotations":{"argocd.argoproj.io/skip-reconcile":"true"}}}`))
+		case r.Method == http.MethodPatch && r.URL.Path == vciStatusPath:
+			patchCalls++
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"forbidden"}`))
+		default:
+			t.Fatalf("unexpected API request %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	wakeCalls := 0
+	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wakeCalls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer wakeServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		wakeRequester: &wakeRequester{
+			client:           wakeServer.Client(),
+			baseURL:          wakeServer.URL,
+			acceptedStatuses: parseStatusSet("502,504"),
+		},
+		updateVCILastActivityOnWake:  true,
+		wakeRetryInterval:            time.Hour,
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+			Annotations: map[string]string{
+				sleepingSinceAnnotation: "1711800000",
+			},
+		},
+	}
+	appsByDestination := map[string][]application{
+		secretName: {
+			{
+				Metadata: metadata{Name: "guestbook-pre-prod"},
+				Operation: &applicationOperation{
+					Sync: json.RawMessage(`{"revision":"abc123"}`),
+				},
+			},
+		},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("expected one wake call, got %d", wakeCalls)
+	}
+	if patchCalls != 1 {
+		t.Fatalf("expected one best-effort VCI status patch attempt, got %d", patchCalls)
+	}
+}
+
 func TestReconcileVCITriggersWakeForActiveKargoPromotionBeforeSyncIntent(t *testing.T) {
 	const secretName = "loft-demo-vcluster-team-a"
 

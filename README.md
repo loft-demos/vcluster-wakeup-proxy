@@ -30,6 +30,7 @@ It polls `VirtualClusterInstance` objects from the management cluster API and th
 - optionally triggers `POST /kubernetes/project/<project>/virtualcluster/<name>` when a matching active Kargo `Promotion` uses `argocd-update`
 - treats `Application.operation.sync` as an explicit wake signal
 - also treats a newly observed Argo CD `OutOfSync` desired revision as a wake signal, so source changes discovered by refresh or webhook can wake a sleeping destination before `Application.operation.sync` exists
+- can optionally patch `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` after a successful wake request to help clear stale sleeping UI state
 - removes `skip-reconcile` and annotates matching apps with `argocd.argoproj.io/refresh: hard` once the vCluster is ready again
 - optionally patches non-Kargo `Application.status.health` while sleeping or waking unless `WATCH_PATCH_APPLICATION_HEALTH=false`
 
@@ -94,6 +95,7 @@ Important watcher settings:
 | `WATCH_WAKE_TOKEN_PATH` | none | Optional path to a file containing the bearer token for the wake request |
 | `WATCH_WAKE_CA_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | CA bundle used when `WATCH_WAKE_UPSTREAM_BASE` is `https://...` |
 | `WATCH_WAKE_RETRY_INTERVAL` | `30s` | Minimum delay before retrying a wake request while the same sync intent is still present and the vCluster remains asleep |
+| `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE` | `false` | When set to `true`, best-effort patches `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` after a successful wake request to help clear stale sleeping UI state |
 | `WATCH_KUBERNETES_API` | auto | Optional Kubernetes API base URL. Defaults to the in-cluster API |
 | `WATCH_KUBERNETES_TIMEOUT` | `10s` | Timeout for watcher Kubernetes API requests |
 | `WATCH_TOKEN_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Bearer token for watcher API calls |
@@ -106,6 +108,8 @@ Application health patching is enabled by default so non-Kargo apps show a helpf
 If your cluster does not expose the `applications/status` subresource, the watcher falls back to patching the `Application` resource itself. If that still is not allowed in your cluster, it automatically disables health patching and continues managing cluster-secret pause/unpause plus app refresh.
 
 When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats active Kargo `Promotion`s that use `argocd-update` as the earliest wake signal for sleeping destinations and still uses `Application.operation.sync` as a fallback. If you already run `cmd/proxy`, you can point `WATCH_WAKE_UPSTREAM_BASE` at the proxy service so the watcher reuses the proxy's tolerant wake semantics for transient `502` / `504` responses. If you do not need that behavior, point the watcher directly at the vCluster Platform API instead.
+
+When `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE=true`, the watcher also performs a best-effort patch of `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` immediately after a successful wake request. This is intended as a pragmatic workaround for environments where platform UI sleep badges can remain stale after a GitOps-driven wake. To use it, apply the VCI status patch RBAC from [deploy/watcher-rbac.yaml](deploy/watcher-rbac.yaml).
 
 Build the watcher image with [Dockerfile.watcher](Dockerfile.watcher).
 

@@ -56,6 +56,7 @@ type watcherConfig struct {
 	argocdClusterSecretNamespace string
 	clusterSecretNameTemplate    string
 	projectNamespacePrefixes     []string
+	updateVCILastActivityOnWake  bool
 	patchApplicationHealth       bool
 	applicationHealthPatchMode   string
 	sleepingHealthMessage        string
@@ -427,6 +428,7 @@ func loadWatcherConfig() (watcherConfig, error) {
 		argocdClusterSecretNamespace: secretNamespace,
 		clusterSecretNameTemplate:    clusterSecretNameTemplate,
 		projectNamespacePrefixes:     projectNamespacePrefixes,
+		updateVCILastActivityOnWake:  strings.EqualFold(mustEnv("WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE", "false"), "true"),
 		patchApplicationHealth:       !strings.EqualFold(mustEnv("WATCH_PATCH_APPLICATION_HEALTH", "true"), "false"),
 		applicationHealthPatchMode:   applicationHealthPatchModeStatus,
 		sleepingHealthMessage:        mustEnv("WATCH_SLEEPING_MESSAGE", "vCluster sleeping"),
@@ -825,6 +827,18 @@ func (a *kubernetesAPI) patchApplicationHealthOnResource(ctx context.Context, na
 			"health": map[string]string{
 				"status":  status,
 				"message": message,
+			},
+		},
+	})
+}
+
+func (a *kubernetesAPI) patchVirtualClusterInstanceLastActivityStatus(ctx context.Context, namespace, name string, lastActivity int64) error {
+	return a.mergePatch(ctx, "/apis/management.loft.sh/v1/namespaces/"+url.PathEscape(namespace)+"/virtualclusterinstances/"+url.PathEscape(name)+"/status", map[string]any{
+		"status": map[string]any{
+			"sleepModeConfig": map[string]any{
+				"status": map[string]any{
+					"lastActivity": lastActivity,
+				},
 			},
 		},
 	})
@@ -1276,6 +1290,29 @@ func annotateApplicationsHardRefresh(ctx context.Context, cfg *watcherConfig, ap
 	return nil
 }
 
+func touchVCILastActivityOnWake(ctx context.Context, cfg *watcherConfig, vci virtualClusterInstance, wakeTime time.Time) {
+	if cfg == nil || cfg.api == nil || !cfg.updateVCILastActivityOnWake {
+		return
+	}
+
+	if err := cfg.api.patchVirtualClusterInstanceLastActivityStatus(ctx, vci.Metadata.Namespace, vci.Metadata.Name, wakeTime.Unix()); err != nil {
+		log.Printf(
+			"best-effort update of VCI %s/%s sleepModeConfig.status.lastActivity failed after wake: %v",
+			vci.Metadata.Namespace,
+			vci.Metadata.Name,
+			err,
+		)
+		return
+	}
+
+	log.Printf(
+		"updated VCI %s/%s sleepModeConfig.status.lastActivity to %d after wake",
+		vci.Metadata.Namespace,
+		vci.Metadata.Name,
+		wakeTime.Unix(),
+	)
+}
+
 func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime, vci virtualClusterInstance, appsByDestination map[string][]application, kargoWakeTriggers map[string]kargoWakeTrigger) error {
 	if runtime == nil {
 		runtime = newWatcherRuntime()
@@ -1367,6 +1404,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 					)
 				}
 
+				touchVCILastActivityOnWake(ctx, cfg, vci, now)
 				runtime.lastWakeAttempt[secretName] = now
 				rememberSyncIntentApplications(runtime, syncIntentApps)
 				rememberRevisionWakeApplications(runtime, revisionWakeApps)
@@ -1493,7 +1531,16 @@ func describeWakeSources(cfg watcherConfig) string {
 		return "disabled"
 	}
 
-	return "kargo-promotions(auto-detect cluster-wide),argocd-sync"
+	sources := []string{
+		"kargo-promotions(auto-detect cluster-wide)",
+		"argocd-sync",
+		"argocd-outofsync-revision",
+	}
+	if cfg.updateVCILastActivityOnWake {
+		sources = append(sources, "vci-lastActivity-status-touch-on-wake")
+	}
+
+	return strings.Join(sources, ",")
 }
 
 func main() {

@@ -48,7 +48,8 @@ spec:
               value: "p-,loft-p-"
             - name: WATCH_PATCH_APPLICATION_HEALTH
               value: "true"
-            # Optional: wake sleeping destinations when Argo sets Application.operation.sync.
+            # Optional: wake sleeping destinations when Argo sets Application.operation.sync
+            # or when the app moves to a newly observed OutOfSync revision.
             # Point this either at the vCluster Platform API directly or at cmd/proxy if you
             # want to reuse its tolerant 502/504 wake handling.
             # - name: WATCH_WAKE_UPSTREAM_BASE
@@ -59,6 +60,12 @@ spec:
             #   value: "10s"
             # - name: WATCH_WAKE_RETRY_INTERVAL
             #   value: "30s"
+            # Optional: after a successful wake request, patch
+            # status.sleepModeConfig.status.lastActivity on the matching
+            # VirtualClusterInstance to help clear stale sleeping UI state.
+            # Requires the VCI status patch RBAC from deploy/watcher-rbac.yaml.
+            # - name: WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE
+            #   value: "true"
           # Uncomment when using WATCH_WAKE_TOKEN_PATH with the example Secret above.
           # volumeMounts:
           #   - name: platform-token
