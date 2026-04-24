@@ -86,6 +86,7 @@ type watcherRuntime struct {
 	observedRefreshRequests  map[string]string
 	observedRevisionWakes    map[string]string
 	observedKargoPromotions  map[string]string
+	observedReadyRefreshes   map[string]bool
 	lastWakeAttempt          map[string]time.Time
 	lastKnownKargoHealth     map[string]healthStatus
 	kargoPromotionsChecked   bool
@@ -481,6 +482,7 @@ func newWatcherRuntime() *watcherRuntime {
 		observedRefreshRequests: map[string]string{},
 		observedRevisionWakes:   map[string]string{},
 		observedKargoPromotions: map[string]string{},
+		observedReadyRefreshes:  map[string]bool{},
 		lastWakeAttempt:         map[string]time.Time{},
 		lastKnownKargoHealth:    map[string]healthStatus{},
 	}
@@ -1426,6 +1428,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 
 	switch state {
 	case vciStateSleeping:
+		delete(runtime.observedReadyRefreshes, secretName)
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		if clusterSecret != nil && !secretPaused {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, true); err != nil {
@@ -1517,6 +1520,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			}
 		}
 	case vciStateWaking:
+		delete(runtime.observedReadyRefreshes, secretName)
 		rememberSyncIntentApplications(runtime, syncIntentApps)
 		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
@@ -1549,10 +1553,14 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretName, vci.Metadata.Namespace, vci.Metadata.Name)
 		}
 
-		if readyTransition {
+		if readyTransition && !runtime.observedReadyRefreshes[secretName] {
 			if err := annotateApplicationsHardRefresh(ctx, cfg, apps); err != nil {
 				return err
 			}
+			runtime.observedReadyRefreshes[secretName] = true
+		}
+		if !readyTransition {
+			delete(runtime.observedReadyRefreshes, secretName)
 		}
 		if cfg.patchApplicationHealth {
 			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps, ""); err != nil {
@@ -1561,6 +1569,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		}
 		delete(runtime.lastWakeAttempt, secretName)
 	case vciStateUnknown:
+		delete(runtime.observedReadyRefreshes, secretName)
 		log.Printf("leaving VCI %s/%s unchanged: state classification is unknown", vci.Metadata.Namespace, vci.Metadata.Name)
 	}
 

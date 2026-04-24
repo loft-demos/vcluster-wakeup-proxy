@@ -866,6 +866,98 @@ func TestReconcileVCITriggersWakeOnNewRefreshRequest(t *testing.T) {
 	}
 }
 
+func TestReconcileVCIHardRefreshesReadyAppsOnlyOncePerReadyTransition(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+
+	var patched []string
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"metadata":{"annotations":{}}}`))
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/applications/guestbook-ready"):
+			patched = append(patched, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+		patchApplicationHealth:       true,
+		sleepingHealthMessage:        "vCluster sleeping",
+		wakingHealthMessage:          "vCluster waking",
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+		},
+		Status: virtualClusterStatus{
+			Phase: "Ready",
+			Conditions: []condition{
+				{Type: virtualClusterOnlineConditionType, Status: "True"},
+			},
+		},
+	}
+	appsByDestination := map[string][]application{
+		secretName: {
+			{
+				Metadata: metadata{Name: "guestbook-ready"},
+				Status: applicationStatus{
+					Health: healthStatus{
+						Status:  "Healthy",
+						Message: "vCluster sleeping",
+					},
+				},
+			},
+		},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patched) != 1 {
+		t.Fatalf("expected one hard refresh patch on first ready reconcile, got %d", len(patched))
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error on second pass: %v", err)
+	}
+	if len(patched) != 1 {
+		t.Fatalf("expected hard refresh to be deduplicated while still ready, got %d patches", len(patched))
+	}
+
+	vci.Status = virtualClusterStatus{}
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error in unknown-state pass: %v", err)
+	}
+
+	vci.Status = virtualClusterStatus{
+		Phase: "Ready",
+		Conditions: []condition{
+			{Type: virtualClusterOnlineConditionType, Status: "True"},
+		},
+	}
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error after re-entering ready: %v", err)
+	}
+	if len(patched) != 2 {
+		t.Fatalf("expected another hard refresh after a new ready transition, got %d patches", len(patched))
+	}
+}
+
 func TestReconcileVCIRetriesWakeAfterCooldownWhenSyncIntentPersists(t *testing.T) {
 	const secretName = "loft-demo-vcluster-team-a"
 
