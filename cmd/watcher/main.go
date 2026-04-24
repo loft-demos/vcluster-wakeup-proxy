@@ -1422,6 +1422,10 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	newRefreshRequestApps := newRefreshRequestApplications(refreshRequestApps, runtime.observedRefreshRequests)
 	revisionWakeApps := applicationsWithRevisionWake(apps)
 	newRevisionWakeApps := newRevisionWakeApplications(revisionWakeApps, runtime.observedRevisionWakes)
+	hasActiveWork := kargoWakeTrigger.Fingerprint != "" ||
+		len(syncIntentApps) > 0 ||
+		len(refreshRequestApps) > 0 ||
+		len(revisionWakeApps) > 0
 	if kargoWakeTrigger.Fingerprint == "" {
 		delete(runtime.observedKargoPromotions, secretName)
 	}
@@ -1546,11 +1550,12 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
 
-		if clusterSecret != nil && secretPaused {
+		if clusterSecret != nil && secretPaused && (readyTransition || hasActiveWork) {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, false); err != nil {
 				return fmt.Errorf("resume cluster secret %s/%s: %w", cfg.argocdClusterSecretNamespace, secretName, err)
 			}
 			log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretName, vci.Metadata.Namespace, vci.Metadata.Name)
+			secretPaused = false
 		}
 
 		if readyTransition && !runtime.observedReadyRefreshes[secretName] {
@@ -1566,6 +1571,12 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			if err := restoreKargoApplicationsHealth(ctx, cfg, runtime, apps, ""); err != nil {
 				return err
 			}
+		}
+		if clusterSecret != nil && !secretPaused && !readyTransition && !hasActiveWork {
+			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, true); err != nil {
+				return fmt.Errorf("pause idle ready cluster secret %s/%s: %w", cfg.argocdClusterSecretNamespace, secretName, err)
+			}
+			log.Printf("re-paused idle ready cluster secret %s/%s for VCI %s/%s", cfg.argocdClusterSecretNamespace, secretName, vci.Metadata.Namespace, vci.Metadata.Name)
 		}
 		delete(runtime.lastWakeAttempt, secretName)
 	case vciStateUnknown:
