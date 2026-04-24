@@ -1424,7 +1424,6 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	newRevisionWakeApps := newRevisionWakeApplications(revisionWakeApps, runtime.observedRevisionWakes)
 	hasActiveWork := kargoWakeTrigger.Fingerprint != "" ||
 		len(syncIntentApps) > 0 ||
-		len(refreshRequestApps) > 0 ||
 		len(revisionWakeApps) > 0
 	if kargoWakeTrigger.Fingerprint == "" {
 		delete(runtime.observedKargoPromotions, secretName)
@@ -1467,12 +1466,9 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			}
 
 			if !shouldWake && len(refreshRequestApps) > 0 {
-				if len(newRefreshRequestApps) > 0 || wakeRetryDue(runtime, secretName, cfg.wakeRetryInterval, now) {
+				if len(newRefreshRequestApps) > 0 {
 					shouldWake = true
 					triggerApps = newRefreshRequestApps
-					if len(triggerApps) == 0 {
-						triggerApps = refreshRequestApps
-					}
 					triggerReason = "refresh request on applications " + strings.Join(applicationNames(triggerApps), ", ")
 				}
 			}

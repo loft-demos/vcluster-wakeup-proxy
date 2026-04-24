@@ -958,6 +958,159 @@ func TestReconcileVCIHardRefreshesReadyAppsOnlyOncePerReadyTransition(t *testing
 	}
 }
 
+func TestReconcileVCIRepausesIdleReadyClusterDespiteStaleRefreshAnnotation(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+
+	var secretPatches int
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"metadata":{"annotations":{}}}`))
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			secretPatches++
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/applications/guestbook-ready"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+		patchApplicationHealth:       true,
+		sleepingHealthMessage:        "vCluster sleeping",
+		wakingHealthMessage:          "vCluster waking",
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+		},
+		Status: virtualClusterStatus{
+			Phase: "Ready",
+			Conditions: []condition{
+				{Type: virtualClusterOnlineConditionType, Status: "True"},
+			},
+		},
+	}
+	appsByDestination := map[string][]application{
+		secretName: {
+			{
+				Metadata: metadata{
+					Name:            "guestbook-ready",
+					ResourceVersion: "42",
+					Annotations: map[string]string{
+						argocdClusterRefreshAnnotation: "normal",
+					},
+				},
+				Status: applicationStatus{
+					Health: healthStatus{
+						Status:  "Healthy",
+						Message: "",
+					},
+				},
+			},
+		},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if secretPatches != 1 {
+		t.Fatalf("expected one secret patch to re-pause idle ready cluster, got %d", secretPatches)
+	}
+}
+
+func TestReconcileVCIDoesNotRetryWakeFromStaleRefreshAnnotationAfterCooldown(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET request to API server, got %s", r.Method)
+		}
+		if !strings.HasSuffix(r.URL.Path, "/secrets/"+secretName) {
+			t.Fatalf("unexpected API path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"metadata":{"annotations":{"argocd.argoproj.io/skip-reconcile":"true"}}}`))
+	}))
+	defer apiServer.Close()
+
+	wakeCalls := 0
+	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wakeCalls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer wakeServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		wakeRequester: &wakeRequester{
+			client:           wakeServer.Client(),
+			baseURL:          wakeServer.URL,
+			acceptedStatuses: parseStatusSet("502,504"),
+		},
+		wakeRetryInterval:            time.Second,
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+			Annotations: map[string]string{
+				sleepingSinceAnnotation: "1711800000",
+			},
+		},
+	}
+	appsByDestination := map[string][]application{
+		secretName: {
+			{
+				Metadata: metadata{
+					Name:            "guestbook-pre-prod",
+					ResourceVersion: "2",
+					Annotations: map[string]string{
+						argocdClusterRefreshAnnotation: "normal",
+					},
+				},
+			},
+		},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("expected one wake call after new refresh request, got %d", wakeCalls)
+	}
+
+	runtime.lastWakeAttempt[secretName] = time.Now().Add(-2 * time.Second)
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error on stale refresh pass: %v", err)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("expected no retry wake from stale refresh annotation, got %d calls", wakeCalls)
+	}
+}
+
 func TestReconcileVCIRetriesWakeAfterCooldownWhenSyncIntentPersists(t *testing.T) {
 	const secretName = "loft-demo-vcluster-team-a"
 
