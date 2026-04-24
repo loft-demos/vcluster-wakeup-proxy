@@ -550,6 +550,22 @@ func TestApplicationsByDestinationName(t *testing.T) {
 	}
 }
 
+func TestApplicationRefreshRequestFingerprint(t *testing.T) {
+	app := application{
+		Metadata: metadata{
+			Name:            "guestbook-dev",
+			ResourceVersion: "42",
+			Annotations: map[string]string{
+				argocdClusterRefreshAnnotation: "normal",
+			},
+		},
+	}
+
+	if got := applicationRefreshRequestFingerprint(app); got != "normal@42" {
+		t.Fatalf("expected refresh fingerprint normal@42, got %q", got)
+	}
+}
+
 func TestApplicationsByAuthorizedStage(t *testing.T) {
 	apps := []application{
 		{
@@ -756,6 +772,97 @@ func TestReconcileVCITriggersWakeOncePerObservedSyncIntent(t *testing.T) {
 	}
 	if wakeCalls != 1 {
 		t.Fatalf("expected wake call to be deduplicated, got %d calls", wakeCalls)
+	}
+}
+
+func TestReconcileVCITriggersWakeOnNewRefreshRequest(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET request to API server, got %s", r.Method)
+		}
+		if !strings.HasSuffix(r.URL.Path, "/secrets/"+secretName) {
+			t.Fatalf("unexpected API path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"metadata":{"annotations":{"argocd.argoproj.io/skip-reconcile":"true"}}}`))
+	}))
+	defer apiServer.Close()
+
+	wakeCalls := 0
+	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST wake request, got %s", r.Method)
+		}
+		if r.URL.Path != "/kubernetes/project/demo/virtualcluster/team-a" {
+			t.Fatalf("unexpected wake path %q", r.URL.Path)
+		}
+		wakeCalls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer wakeServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		wakeRequester: &wakeRequester{
+			client:           wakeServer.Client(),
+			baseURL:          wakeServer.URL,
+			acceptedStatuses: parseStatusSet("502,504"),
+		},
+		wakeRetryInterval:            time.Hour,
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+			Annotations: map[string]string{
+				sleepingSinceAnnotation: "1711800000",
+			},
+		},
+	}
+	appsByDestination := map[string][]application{
+		secretName: {
+			{
+				Metadata: metadata{
+					Name:            "guestbook-pre-prod",
+					ResourceVersion: "2",
+					Annotations: map[string]string{
+						argocdClusterRefreshAnnotation: "normal",
+					},
+				},
+			},
+		},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("expected one wake call after new refresh request, got %d", wakeCalls)
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error on second pass: %v", err)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("expected refresh-triggered wake to be deduplicated, got %d calls", wakeCalls)
+	}
+
+	appsByDestination[secretName][0].Metadata.ResourceVersion = "3"
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error on refreshed pass: %v", err)
+	}
+	if wakeCalls != 2 {
+		t.Fatalf("expected a second wake call after a new refresh request, got %d", wakeCalls)
 	}
 }
 

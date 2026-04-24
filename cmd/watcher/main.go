@@ -83,6 +83,7 @@ type wakeRequester struct {
 
 type watcherRuntime struct {
 	observedSyncIntents      map[string]string
+	observedRefreshRequests  map[string]string
 	observedRevisionWakes    map[string]string
 	observedKargoPromotions  map[string]string
 	lastWakeAttempt          map[string]time.Time
@@ -92,10 +93,11 @@ type watcherRuntime struct {
 }
 
 type metadata struct {
-	Name        string            `json:"name"`
-	Namespace   string            `json:"namespace"`
-	Labels      map[string]string `json:"labels"`
-	Annotations map[string]string `json:"annotations"`
+	Name            string            `json:"name"`
+	Namespace       string            `json:"namespace"`
+	ResourceVersion string            `json:"resourceVersion"`
+	Labels          map[string]string `json:"labels"`
+	Annotations     map[string]string `json:"annotations"`
 }
 
 type condition struct {
@@ -476,6 +478,7 @@ func (w *wakeRequester) Execute(ctx context.Context, project, virtualCluster str
 func newWatcherRuntime() *watcherRuntime {
 	return &watcherRuntime{
 		observedSyncIntents:     map[string]string{},
+		observedRefreshRequests: map[string]string{},
 		observedRevisionWakes:   map[string]string{},
 		observedKargoPromotions: map[string]string{},
 		lastWakeAttempt:         map[string]time.Time{},
@@ -984,6 +987,31 @@ func applicationsWithSyncIntent(apps []application) []application {
 	return filtered
 }
 
+func applicationRefreshRequestFingerprint(app application) string {
+	raw := strings.TrimSpace(app.Metadata.Annotations[argocdClusterRefreshAnnotation])
+	if raw == "" {
+		return ""
+	}
+
+	resourceVersion := strings.TrimSpace(app.Metadata.ResourceVersion)
+	if resourceVersion == "" {
+		return raw
+	}
+
+	return raw + "@" + resourceVersion
+}
+
+func applicationsWithRefreshRequest(apps []application) []application {
+	var filtered []application
+	for _, app := range apps {
+		if applicationRefreshRequestFingerprint(app) == "" {
+			continue
+		}
+		filtered = append(filtered, app)
+	}
+	return filtered
+}
+
 func applicationRevisionWakeFingerprint(app application) string {
 	if applicationSyncIntentFingerprint(app) != "" {
 		return ""
@@ -1019,6 +1047,18 @@ func newSyncIntentApplications(apps []application, observed map[string]string) [
 	return filtered
 }
 
+func newRefreshRequestApplications(apps []application, observed map[string]string) []application {
+	var filtered []application
+	for _, app := range apps {
+		fingerprint := applicationRefreshRequestFingerprint(app)
+		if fingerprint == "" || observed[app.Metadata.Name] == fingerprint {
+			continue
+		}
+		filtered = append(filtered, app)
+	}
+	return filtered
+}
+
 func newRevisionWakeApplications(apps []application, observed map[string]string) []application {
 	var filtered []application
 	for _, app := range apps {
@@ -1042,6 +1082,20 @@ func rememberSyncIntentApplications(runtime *watcherRuntime, apps []application)
 			continue
 		}
 		delete(runtime.observedSyncIntents, app.Metadata.Name)
+	}
+}
+
+func rememberRefreshRequestApplications(runtime *watcherRuntime, apps []application) {
+	if runtime == nil {
+		return
+	}
+
+	for _, app := range apps {
+		if fingerprint := applicationRefreshRequestFingerprint(app); fingerprint != "" {
+			runtime.observedRefreshRequests[app.Metadata.Name] = fingerprint
+			continue
+		}
+		delete(runtime.observedRefreshRequests, app.Metadata.Name)
 	}
 }
 
@@ -1077,6 +1131,27 @@ func forgetCompletedSyncIntentApplications(runtime *watcherRuntime, apps []appli
 			continue
 		}
 		delete(runtime.observedSyncIntents, name)
+	}
+}
+
+func forgetCompletedRefreshRequestApplications(runtime *watcherRuntime, apps []application) {
+	if runtime == nil {
+		return
+	}
+
+	active := make(map[string]struct{}, len(apps))
+	for _, app := range apps {
+		if applicationRefreshRequestFingerprint(app) == "" {
+			continue
+		}
+		active[app.Metadata.Name] = struct{}{}
+	}
+
+	for name := range runtime.observedRefreshRequests {
+		if _, ok := active[name]; ok {
+			continue
+		}
+		delete(runtime.observedRefreshRequests, name)
 	}
 }
 
@@ -1341,6 +1416,8 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	state := classifyVCI(vci, secretPaused)
 	syncIntentApps := applicationsWithSyncIntent(apps)
 	newSyncIntentApps := newSyncIntentApplications(syncIntentApps, runtime.observedSyncIntents)
+	refreshRequestApps := applicationsWithRefreshRequest(apps)
+	newRefreshRequestApps := newRefreshRequestApplications(refreshRequestApps, runtime.observedRefreshRequests)
 	revisionWakeApps := applicationsWithRevisionWake(apps)
 	newRevisionWakeApps := newRevisionWakeApplications(revisionWakeApps, runtime.observedRevisionWakes)
 	if kargoWakeTrigger.Fingerprint == "" {
@@ -1382,6 +1459,17 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 				}
 			}
 
+			if !shouldWake && len(refreshRequestApps) > 0 {
+				if len(newRefreshRequestApps) > 0 || wakeRetryDue(runtime, secretName, cfg.wakeRetryInterval, now) {
+					shouldWake = true
+					triggerApps = newRefreshRequestApps
+					if len(triggerApps) == 0 {
+						triggerApps = refreshRequestApps
+					}
+					triggerReason = "refresh request on applications " + strings.Join(applicationNames(triggerApps), ", ")
+				}
+			}
+
 			if !shouldWake && len(revisionWakeApps) > 0 {
 				if len(newRevisionWakeApps) > 0 || wakeRetryDue(runtime, secretName, cfg.wakeRetryInterval, now) {
 					shouldWake = true
@@ -1407,6 +1495,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 				touchVCILastActivityOnWake(ctx, cfg, vci, now)
 				runtime.lastWakeAttempt[secretName] = now
 				rememberSyncIntentApplications(runtime, syncIntentApps)
+				rememberRefreshRequestApplications(runtime, refreshRequestApps)
 				rememberRevisionWakeApplications(runtime, revisionWakeApps)
 				if kargoWakeTrigger.Fingerprint != "" {
 					runtime.observedKargoPromotions[secretName] = kargoWakeTrigger.Fingerprint
@@ -1429,6 +1518,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		}
 	case vciStateWaking:
 		rememberSyncIntentApplications(runtime, syncIntentApps)
+		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		if clusterSecret != nil && !secretPaused {
@@ -1449,6 +1539,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		readyTransition := secretPaused || applicationsNeedReadyRefresh(apps, *cfg)
 		rememberSyncIntentApplications(runtime, syncIntentApps)
+		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
 
 		if clusterSecret != nil && secretPaused {
@@ -1487,6 +1578,7 @@ func reconcileAll(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		return fmt.Errorf("list applications in namespace %s: %w", cfg.argocdApplicationNamespace, err)
 	}
 	forgetCompletedSyncIntentApplications(runtime, apps)
+	forgetCompletedRefreshRequestApplications(runtime, apps)
 	forgetCompletedRevisionWakeApplications(runtime, apps)
 	appsByDestination := applicationsByDestinationName(apps)
 	promotions, err := listPromotionsOptional(ctx, cfg, runtime)
@@ -1534,6 +1626,7 @@ func describeWakeSources(cfg watcherConfig) string {
 	sources := []string{
 		"kargo-promotions(auto-detect cluster-wide)",
 		"argocd-sync",
+		"argocd-refresh-request",
 		"argocd-outofsync-revision",
 	}
 	if cfg.updateVCILastActivityOnWake {
