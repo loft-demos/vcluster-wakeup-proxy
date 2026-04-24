@@ -9,8 +9,8 @@ The recommended architecture is:
 - `cmd/watcher` observes `VirtualClusterInstance` state and matching Argo CD `Application` objects
 - when Kargo is installed, the watcher can also observe active `Promotion` objects that use `argocd-update`
 - the watcher pauses sleeping destinations by patching imported cluster Secrets with `argocd.argoproj.io/skip-reconcile: "true"`
-- when a matching Kargo promotion, Argo app sync intent, or newly observed OutOfSync desired revision appears, the watcher can trigger the vCluster wake request directly
-- once the vCluster is ready again, the watcher removes `skip-reconcile` and hard-refreshes the affected Argo CD apps
+- when a matching Kargo promotion, Argo app sync intent, newly observed refresh request, or newly observed OutOfSync desired revision appears, the watcher can trigger the vCluster wake request directly
+- once the vCluster is ready again, the watcher removes `skip-reconcile`, hard-refreshes the affected Argo CD apps once per ready transition, and then re-pauses idle ready destinations so Argo CD does not keep background traffic alive unnecessarily
 
 For Kargo-driven promotions that end with `argocd-update`, this means Argo CD Notifications and Kargo `http` steps are not needed just to wake sleeping vClusters. The watcher can wake from the Kargo `Promotion` itself before Argo CD has finished creating `Application.operation.sync`.
 
@@ -29,9 +29,11 @@ It polls `VirtualClusterInstance` objects from the management cluster API and th
 - patches the imported cluster Secret with `argocd.argoproj.io/skip-reconcile: "true"` while the vCluster is sleeping or waking
 - optionally triggers `POST /kubernetes/project/<project>/virtualcluster/<name>` when a matching active Kargo `Promotion` uses `argocd-update`
 - treats `Application.operation.sync` as an explicit wake signal
+- also treats a newly observed Argo CD refresh annotation as a wake signal, so webhook-driven refreshes can wake a sleeping destination before Argo has started the sync
 - also treats a newly observed Argo CD `OutOfSync` desired revision as a wake signal, so source changes discovered by refresh or webhook can wake a sleeping destination before `Application.operation.sync` exists
 - can optionally patch `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` after a successful wake request to help clear stale sleeping UI state
-- removes `skip-reconcile` and annotates matching apps with `argocd.argoproj.io/refresh: hard` once the vCluster is ready again
+- removes `skip-reconcile` and annotates matching apps with `argocd.argoproj.io/refresh: hard` once per ready transition
+- re-applies `argocd.argoproj.io/skip-reconcile: "true"` on idle ready destinations after wake/sync work has settled so Argo CD cluster-cache traffic does not keep the vCluster warm indefinitely
 - optionally patches non-Kargo `Application.status.health` while sleeping or waking unless `WATCH_PATCH_APPLICATION_HEALTH=false`
 
 Sleep detection prefers the platform-managed annotations `sleepmode.loft.sh/sleeping-since` and `sleepmode.loft.sh/sleep-type`, then falls back to `status.phase`, `status.reason`, `status.message`, and the `VirtualClusterOnline` condition.
@@ -40,7 +42,7 @@ Sleep detection prefers the platform-managed annotations `sleepmode.loft.sh/slee
 
 The cluster-secret pause path is meant for Argo CD `v3.4.0-rc1` or newer, where cluster-secret `argocd.argoproj.io/skip-reconcile: "true"` is honored by the application controller.
 
-For Kargo, the deterministic trigger is a promotion template that ends with `argocd-update`. When Kargo `Promotion` objects are readable, the watcher wakes sleeping destinations from those active promotions before Argo CD finishes creating `Application.operation.sync`. Without Kargo, the watcher still wakes from Argo-only signals: explicit `Application.operation.sync` requests and newly observed `OutOfSync` desired revisions, which lets webhook- or refresh-discovered source changes wake a sleeping destination even before Argo starts the sync operation.
+For Kargo, the deterministic trigger is a promotion template that ends with `argocd-update`. When Kargo `Promotion` objects are readable, the watcher wakes sleeping destinations from those active promotions before Argo CD finishes creating `Application.operation.sync`. Without Kargo, the watcher still wakes from Argo-only signals: explicit `Application.operation.sync` requests, newly observed refresh annotations, and newly observed `OutOfSync` desired revisions, which lets webhook- or refresh-discovered source changes wake a sleeping destination even before Argo starts the sync operation.
 
 Important Kargo caveat: if a destination vCluster is put to sleep while a `Promotion` is still verifying, that verification can fail. The watcher handles the Argo CD sync and wake path, but it does not treat sleep during an active Kargo verification window as success. In practice, sleep should be considered safe only after the Stage is back to `Ready=True` / `Healthy=True`, unless you intentionally plan to override the failed verification.
 
@@ -49,27 +51,31 @@ Important Kargo caveat: if a destination vCluster is put to sleep while a `Promo
 1. A source change creates new `Freight` in Kargo.
 2. A promotion runs and ends with `argocd-update`.
 3. The watcher sees the active Kargo `Promotion` for the sleeping destination and triggers the wake request.
-4. Argo CD writes `Application.operation.sync` on the target app.
+4. Argo CD writes `Application.operation.sync` on the target app, or a webhook-triggered refresh is observed before that sync exists.
 5. The watcher keeps cluster-secret `skip-reconcile=true` while the vCluster is sleeping or waking.
-6. When the `VirtualClusterInstance` becomes ready, the watcher removes `skip-reconcile` and hard-refreshes the app.
+6. When the `VirtualClusterInstance` becomes ready, the watcher removes `skip-reconcile` and hard-refreshes the app once for that ready transition.
 7. Argo CD performs the real sync, and Kargo can wait on the real Argo `Healthy` state.
+8. After the destination is idle again, the watcher re-applies `skip-reconcile=true` so background Argo traffic does not keep the vCluster awake indefinitely.
 
 With that watcher-first flow, Argo CD Notifications and Kargo `http` steps are not required for wakeup orchestration.
 
-### No Need for `sleepmode.loft.sh/ignore-user-agents`
+### Reduced Need for `sleepmode.loft.sh/ignore-user-agents`
 
 The vCluster sleep documentation describes [`sleepmode.loft.sh/ignore-user-agents`](https://www.vcluster.com/docs/vcluster/key-features/sleep#ignore-other-types-of-activity-in-auto-sleep) as a way to ignore specific request user agents, including wildcard patterns such as `argo*`, when deciding whether traffic should keep a vCluster awake or wake it back up.
 
 That can be useful as a broad sleep-protection workaround, but it has an important downside for GitOps: when Argo CD is ignored at the sleep layer, an Argo-driven sync request will also not wake the sleeping destination. In practice, that means the same annotation that prevents unwanted Argo traffic from disturbing sleep can also block the desired wake-up path when an `Application` actually needs to deploy.
 
-`vcluster-gitops-watcher` removes the need to depend on that tradeoff. Instead of relying on Argo traffic to hit a sleeping vCluster directly, the watcher observes Argo CD and optional Kargo intent from the management plane, pauses reconciliation while the destination is sleeping or waking, triggers the wake request explicitly, and only lets Argo continue once the `VirtualClusterInstance` is ready again.
+`vcluster-gitops-watcher` is intended to reduce the need to depend on that tradeoff. Instead of relying on Argo traffic to hit a sleeping vCluster directly, the watcher observes Argo CD and optional Kargo intent from the management plane, pauses reconciliation while the destination is sleeping or waking, triggers the wake request explicitly, and only lets Argo continue once the `VirtualClusterInstance` is ready again.
+
+In practice, some environments can still need `sleepmode.loft.sh/ignore-user-agents: argo*` as a fallback while validating that cluster-secret `skip-reconcile` is fully stopping Argo background cluster-cache traffic. If you use that annotation, treat it as a pragmatic compatibility workaround rather than the preferred steady-state design.
 
 For self-hosted Argo CD, this gives a cleaner model:
 
-- `sleepmode.loft.sh/ignore-user-agents: argo*` is no longer needed just to keep sleeping vClusters quiet
+- `sleepmode.loft.sh/ignore-user-agents: argo*` is often not needed just to keep sleeping vClusters quiet, but it can still be a practical fallback in environments where Argo background traffic continues despite cluster-secret pausing
 - an Argo `Application.operation.sync` can still act as a wake signal when Kargo is not in use
+- a newly observed Argo refresh annotation can also act as an early wake signal before sync intent appears
 - Kargo promotions that end with `argocd-update` can wake even earlier, before Argo finishes writing `Application.operation.sync`
-- Argo reconciles only after the destination is actually ready
+- Argo reconciles only after the destination is actually ready, and idle ready destinations are re-paused afterward
 
 ### Watcher Configuration
 
@@ -88,7 +94,7 @@ Important watcher settings:
 | `WATCH_PATCH_APPLICATION_HEALTH` | `true` | When not set to `false`, patches non-Kargo `Application.status.health` to `Suspended` or `Progressing` while Argo is paused |
 | `WATCH_SLEEPING_MESSAGE` | `vCluster sleeping` | Health message written when app health patching is enabled |
 | `WATCH_WAKING_MESSAGE` | `vCluster waking` | Health message written when app health patching is enabled |
-| `WATCH_WAKE_UPSTREAM_BASE` | disabled | Optional base URL used to trigger `POST /kubernetes/project/<project>/virtualcluster/<name>` when a sleeping destination has an active Kargo `Promotion` or `Application.operation.sync` |
+| `WATCH_WAKE_UPSTREAM_BASE` | disabled | Optional base URL used to trigger `POST /kubernetes/project/<project>/virtualcluster/<name>` when a sleeping destination has an active Kargo `Promotion`, a new Argo refresh request, or `Application.operation.sync` |
 | `WATCH_WAKE_TIMEOUT` | `10s` | Timeout for the wake request HTTP client |
 | `WATCH_WAKE_SUCCESS_ON` | `502,504` | Comma-separated additional wake response codes treated as accepted, beyond `200` and `202` |
 | `WATCH_WAKE_BEARER_TOKEN` | none | Optional bearer token sent with the wake request |
@@ -107,7 +113,7 @@ Application health patching is enabled by default so non-Kargo apps show a helpf
 
 If your cluster does not expose the `applications/status` subresource, the watcher falls back to patching the `Application` resource itself. If that still is not allowed in your cluster, it automatically disables health patching and continues managing cluster-secret pause/unpause plus app refresh.
 
-When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats active Kargo `Promotion`s that use `argocd-update` as the earliest wake signal for sleeping destinations and still uses `Application.operation.sync` as a fallback. If you already run `cmd/proxy`, you can point `WATCH_WAKE_UPSTREAM_BASE` at the proxy service so the watcher reuses the proxy's tolerant wake semantics for transient `502` / `504` responses. If you do not need that behavior, point the watcher directly at the vCluster Platform API instead.
+When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats active Kargo `Promotion`s that use `argocd-update` as the earliest wake signal for sleeping destinations and still uses Argo-only signals such as `Application.operation.sync`, newly observed refresh annotations, and newly observed `OutOfSync` revisions as fallbacks. If you already run `cmd/proxy`, you can point `WATCH_WAKE_UPSTREAM_BASE` at the proxy service so the watcher reuses the proxy's tolerant wake semantics for transient `502` / `504` responses. If you do not need that behavior, point the watcher directly at the vCluster Platform API instead.
 
 When `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE=true`, the watcher also performs a best-effort patch of `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` immediately after a successful wake request. This is intended as a pragmatic workaround for environments where platform UI sleep badges can remain stale after a GitOps-driven wake. To use it, apply the VCI status patch RBAC from [deploy/watcher-rbac.yaml](deploy/watcher-rbac.yaml).
 

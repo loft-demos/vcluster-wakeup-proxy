@@ -1541,7 +1541,8 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		}
 	case vciStateReady:
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
-		readyTransition := secretPaused || applicationsNeedReadyRefresh(apps, *cfg)
+		needsReadyRefresh := applicationsNeedReadyRefresh(apps, *cfg)
+		readyTransition := secretPaused || (needsReadyRefresh && !runtime.observedReadyRefreshes[secretName])
 		rememberSyncIntentApplications(runtime, syncIntentApps)
 		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
@@ -1577,6 +1578,12 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		delete(runtime.lastWakeAttempt, secretName)
 	case vciStateUnknown:
 		delete(runtime.observedReadyRefreshes, secretName)
+		if clusterSecret != nil && !secretPaused && !hasActiveWork {
+			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, true); err != nil {
+				return fmt.Errorf("pause cluster secret %s/%s during unknown state: %w", cfg.argocdClusterSecretNamespace, secretName, err)
+			}
+			log.Printf("paused cluster secret %s/%s while VCI %s/%s is in unknown state with no active work", cfg.argocdClusterSecretNamespace, secretName, vci.Metadata.Namespace, vci.Metadata.Name)
+		}
 		log.Printf("leaving VCI %s/%s unchanged: state classification is unknown", vci.Metadata.Namespace, vci.Metadata.Name)
 	}
 

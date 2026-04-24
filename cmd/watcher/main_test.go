@@ -875,6 +875,8 @@ func TestReconcileVCIHardRefreshesReadyAppsOnlyOncePerReadyTransition(t *testing
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"metadata":{"annotations":{}}}`))
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/applications/guestbook-ready"):
 			patched = append(patched, r.URL.Path)
 			w.WriteHeader(http.StatusOK)
@@ -1030,6 +1032,136 @@ func TestReconcileVCIRepausesIdleReadyClusterDespiteStaleRefreshAnnotation(t *te
 	}
 	if secretPatches != 1 {
 		t.Fatalf("expected one secret patch to re-pause idle ready cluster, got %d", secretPatches)
+	}
+}
+
+func TestReconcileVCIRepausesIdleReadyClusterAfterOneManagedHealthRefresh(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+
+	var secretPatches int
+	var appPatches int
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"metadata":{"annotations":{}}}`))
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			secretPatches++
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/applications/guestbook-ready"):
+			appPatches++
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+		patchApplicationHealth:       true,
+		sleepingHealthMessage:        "vCluster sleeping",
+		wakingHealthMessage:          "vCluster waking",
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+		},
+		Status: virtualClusterStatus{
+			Phase: "Ready",
+			Conditions: []condition{
+				{Type: virtualClusterOnlineConditionType, Status: "True"},
+			},
+		},
+	}
+	appsByDestination := map[string][]application{
+		secretName: {
+			{
+				Metadata: metadata{Name: "guestbook-ready"},
+				Status: applicationStatus{
+					Health: healthStatus{
+						Status:  "Healthy",
+						Message: "vCluster sleeping",
+					},
+				},
+			},
+		},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error on first ready pass: %v", err)
+	}
+	if appPatches != 1 {
+		t.Fatalf("expected one application refresh patch on first ready pass, got %d", appPatches)
+	}
+	if secretPatches != 0 {
+		t.Fatalf("expected no secret patch on first ready pass, got %d", secretPatches)
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error on second ready pass: %v", err)
+	}
+	if appPatches != 1 {
+		t.Fatalf("expected no extra application refresh patch on second ready pass, got %d", appPatches)
+	}
+	if secretPatches != 1 {
+		t.Fatalf("expected one secret patch to re-pause idle ready cluster on second ready pass, got %d", secretPatches)
+	}
+}
+
+func TestReconcileVCIPausesUnknownStateClusterWhenIdle(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+
+	var secretPatches int
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"metadata":{"annotations":{}}}`))
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			secretPatches++
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+		},
+		Status: virtualClusterStatus{},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, map[string][]application{secretName: nil}, nil); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if secretPatches != 1 {
+		t.Fatalf("expected one secret patch to pause unknown idle cluster, got %d", secretPatches)
 	}
 }
 
