@@ -1040,13 +1040,23 @@ func TestReconcileVCIRepausesIdleReadyClusterAfterOneManagedHealthRefresh(t *tes
 
 	var secretPatches int
 	var appPatches int
+	secretPaused := false
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"metadata":{"annotations":{}}}`))
+			if secretPaused {
+				_, _ = w.Write([]byte(`{"metadata":{"annotations":{"argocd.argoproj.io/skip-reconcile":"true"}}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"metadata":{"annotations":{}}}`))
+			}
 		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
 			secretPatches++
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read secret patch body: %v", err)
+			}
+			secretPaused = strings.Contains(string(body), `"argocd.argoproj.io/skip-reconcile":"true"`)
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/applications/guestbook-ready"):
 			appPatches++
@@ -1116,6 +1126,16 @@ func TestReconcileVCIRepausesIdleReadyClusterAfterOneManagedHealthRefresh(t *tes
 	}
 	if secretPatches != 1 {
 		t.Fatalf("expected one secret patch to re-pause idle ready cluster on second ready pass, got %d", secretPatches)
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+		t.Fatalf("unexpected reconcile error on third ready pass: %v", err)
+	}
+	if appPatches != 1 {
+		t.Fatalf("expected no extra application refresh patch on third ready pass, got %d", appPatches)
+	}
+	if secretPatches != 1 {
+		t.Fatalf("expected paused idle ready cluster to stay paused on third ready pass, got %d secret patches", secretPatches)
 	}
 }
 

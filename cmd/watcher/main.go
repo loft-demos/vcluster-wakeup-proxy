@@ -1542,12 +1542,13 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	case vciStateReady:
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		needsReadyRefresh := applicationsNeedReadyRefresh(apps, *cfg)
-		readyTransition := secretPaused || (needsReadyRefresh && !runtime.observedReadyRefreshes[secretName])
+		needsOneTimeReadyRefresh := needsReadyRefresh && !runtime.observedReadyRefreshes[secretName]
+		shouldUnpauseReadyCluster := hasActiveWork || needsOneTimeReadyRefresh
 		rememberSyncIntentApplications(runtime, syncIntentApps)
 		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
 
-		if clusterSecret != nil && secretPaused && (readyTransition || hasActiveWork) {
+		if clusterSecret != nil && secretPaused && shouldUnpauseReadyCluster {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, false); err != nil {
 				return fmt.Errorf("resume cluster secret %s/%s: %w", cfg.argocdClusterSecretNamespace, secretName, err)
 			}
@@ -1555,13 +1556,13 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			secretPaused = false
 		}
 
-		if readyTransition && !runtime.observedReadyRefreshes[secretName] {
+		if needsOneTimeReadyRefresh {
 			if err := annotateApplicationsHardRefresh(ctx, cfg, apps); err != nil {
 				return err
 			}
 			runtime.observedReadyRefreshes[secretName] = true
 		}
-		if !readyTransition {
+		if !needsReadyRefresh {
 			delete(runtime.observedReadyRefreshes, secretName)
 		}
 		if cfg.patchApplicationHealth {
@@ -1569,7 +1570,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 				return err
 			}
 		}
-		if clusterSecret != nil && !secretPaused && !readyTransition && !hasActiveWork {
+		if clusterSecret != nil && !secretPaused && !shouldUnpauseReadyCluster {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretName, true); err != nil {
 				return fmt.Errorf("pause idle ready cluster secret %s/%s: %w", cfg.argocdClusterSecretNamespace, secretName, err)
 			}
